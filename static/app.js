@@ -18,6 +18,7 @@ const els = {
   searchInput: document.querySelector("#searchInput"),
   sortSelect: document.querySelector("#sortSelect"),
   refreshButton: document.querySelector("#refreshButton"),
+  requestLink: document.querySelector("#requestLink"),
   logoutButton: document.querySelector("#logoutButton"),
   autoRefresh: document.querySelector("#autoRefresh"),
   lastUpdated: document.querySelector("#lastUpdated"),
@@ -649,6 +650,14 @@ async function fetchJson(url) {
   return response.json();
 }
 
+async function loadAuthState() {
+  const auth = await fetchJson("/api/auth/me");
+  if (!auth.auth_enabled) {
+    if (els.requestLink) els.requestLink.hidden = true;
+    if (els.logoutButton) els.logoutButton.hidden = true;
+  }
+}
+
 async function loadMeta() {
   const meta = await fetchJson("/api/servers");
   state.servers = meta.servers || [];
@@ -712,6 +721,7 @@ els.searchInput.addEventListener("input", render);
 els.sortSelect.addEventListener("change", render);
 
 (async function start() {
+  await loadAuthState();
   await loadMeta();
   await loadSnapshot(false);
   schedule();

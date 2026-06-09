@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Resource Requests - Server Probe Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260609-requests" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Access Request</p>
+          <h1 id="pageTitle">资源申请</h1>
+        </div>
+        <div class="status-strip compact">
+          <div class="stat-chip"><span id="pendingCount">0</span><small>待处理</small></div>
+          <div class="stat-chip warn"><span id="approvedCount">0</span><small>已通过</small></div>
+          <div class="stat-chip danger"><span id="rejectedCount">0</span><small>已拒绝</small></div>
+        </div>
+      </header>
+
+      <section class="toolbar request-toolbar">
+        <a id="dashboardLink" class="button ghost link-button" href="/">监控面板</a>
+        <span id="userBadge" class="toolbar-note"></span>
+        <button id="logoutButton" class="button ghost" type="button">退出</button>
+      </section>
+
+      <main class="request-layout">
+        <section class="request-panel" id="userAdminPanel" hidden>
+          <div class="panel-head">
+            <h2>创建用户</h2>
+            <span>管理员创建账号，不开放注册</span>
+          </div>
+          <form id="userForm" class="request-form compact-form">
+            <label>用户名 <input name="username" required /></label>
+            <label>初始密码 <input name="password" type="password" required /></label>
+            <label>
+              角色
+              <select name="role">
+                <option value="user">普通用户</option>
+                <option value="admin">管理员</option>
+              </select>
+            </label>
+            <button class="button" type="submit">创建/重置</button>
+            <p id="userFormMessage" class="form-message"></p>
+          </form>
+          <div id="userList" class="mini-list"></div>
+        </section>
+
+        <section class="request-panel">
+          <div class="panel-head">
+            <h2>提交模型需求</h2>
+            <span>系统会根据当前资源给出机器建议</span>
+          </div>
+          <form id="requestForm" class="request-form">
+            <label>模型名称 <input name="model_name" placeholder="例如 Llama / Qwen / custom model" required /></label>
+            <label>模型规模 <input name="model_size" placeholder="例如 7B, 32B, 72B" /></label>
+            <label>
+              使用方式
+              <select name="access_type">
+                <option value="ssh">需要机器/SSH</option>
+                <option value="api">只需要 API</option>
+                <option value="both">机器和 API 都需要</option>
+              </select>
+            </label>
+            <div class="form-grid">
+              <label>GPU 数量 <input name="gpu_count" type="number" min="0" max="16" value="1" /></label>
+              <label>单卡空闲显存 GB <input name="gpu_memory_gb" type="number" min="0" step="0.5" value="16" /></label>
+              <label>预计时长 小时 <input name="duration_hours" type="number" min="1" step="1" value="24" /></label>
+            </div>
+            <label>用途说明 <textarea name="purpose" rows="4" required placeholder="说明要跑什么、预计负载、是否需要长期占用"></textarea></label>
+            <label>补充说明 <textarea name="notes" rows="3" placeholder="环境、端口、数据路径等要求"></textarea></label>
+            <button id="submitRequestButton" class="button" type="submit">提交申请</button>
+            <p id="requestFormMessage" class="form-message"></p>
+          </form>
+        </section>
+
+        <section class="request-panel wide">
+          <div class="panel-head">
+            <h2 id="requestListTitle">我的申请</h2>
+            <button id="reloadButton" class="button ghost" type="button">刷新</button>
+          </div>
+          <div id="requestList" class="request-list"></div>
+        </section>
+      </main>
+    </div>
+    <script src="/static/requests.js?v=20260609-requests"></script>
+  </body>
+</html>

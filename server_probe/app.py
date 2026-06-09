@@ -345,6 +345,85 @@ class Monitor:
         with self.history_lock:
             return {server_id: list(samples) for server_id, samples in self.history.items()}
 
+    def resource_recommendation(self, requirements):
+        gpu_count = max(0, int(as_number(requirements.get("gpu_count")) or 0))
+        memory_gb = as_number(requirements.get("gpu_memory_gb")) or 0
+        memory_bytes = memory_gb * 1024 * 1024 * 1024
+        with self.snapshot_lock:
+            snapshot = self.latest_snapshot or self.empty_snapshot()
+            results = list(snapshot.get("results") or [])
+
+        candidates = []
+        for result in results:
+            if result.get("status") != "online":
+                continue
+            metrics = result.get("metrics") or {}
+            devices = ((metrics.get("gpu") or {}).get("devices") or [])
+            cpu = as_number((metrics.get("cpu") or {}).get("percent")) or 0
+            mem = as_number((metrics.get("memory") or {}).get("percent")) or 0
+            if gpu_count <= 0:
+                score = (100 - cpu) + (100 - mem)
+                candidates.append(
+                    {
+                        "server_id": result.get("id"),
+                        "server_name": result.get("name"),
+                        "group": result.get("group"),
+                        "gpu_indices": [],
+                        "free_gpu_memory_gb": None,
+                        "max_gpu_util_percent": None,
+                        "cpu_percent": rounded(cpu),
+                        "memory_percent": rounded(mem),
+                        "score": rounded(score),
+                        "reason": "CPU and memory are currently available",
+                    }
+                )
+                continue
+
+            usable = []
+            for device in devices:
+                total = as_number(device.get("memory_total_bytes")) or 0
+                used = as_number(device.get("memory_used_bytes")) or 0
+                free = max(total - used, 0)
+                util = as_number(device.get("utilization_percent")) or 0
+                if free >= memory_bytes:
+                    usable.append(
+                        {
+                            "index": str(device.get("index")),
+                            "free": free,
+                            "util": util,
+                        }
+                    )
+            usable.sort(key=lambda item: (item["util"], -item["free"]))
+            if len(usable) < gpu_count:
+                continue
+            selected = usable[:gpu_count]
+            total_free = sum(item["free"] for item in selected)
+            max_util = max(item["util"] for item in selected) if selected else None
+            score = (total_free / (1024 * 1024 * 1024)) - (max_util or 0) - cpu * 0.2 - mem * 0.1
+            candidates.append(
+                {
+                    "server_id": result.get("id"),
+                    "server_name": result.get("name"),
+                    "group": result.get("group"),
+                    "gpu_indices": [item["index"] for item in selected],
+                    "free_gpu_memory_gb": round(total_free / (1024 * 1024 * 1024), 1),
+                    "max_gpu_util_percent": rounded(max_util),
+                    "cpu_percent": rounded(cpu),
+                    "memory_percent": rounded(mem),
+                    "score": rounded(score),
+                    "reason": "Enough GPUs match the requested free memory",
+                }
+            )
+
+        candidates.sort(key=lambda item: item.get("score") or 0, reverse=True)
+        return {
+            "generated_at": utc_now_iso(),
+            "requested_gpu_count": gpu_count,
+            "requested_gpu_memory_gb": rounded(memory_gb),
+            "candidates": candidates[:5],
+            "message": "Found matching machines" if candidates else "No matching online machines found",
+        }
+
     def cached_snapshot(self, trigger=False):
         if trigger or self.latest_snapshot is None:
             self.trigger_refresh(force=True)
@@ -578,18 +657,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def current_user(self):
         if not self.auth_enabled:
-            return {"username": "anonymous"}
+            return {"username": "anonymous", "role": "admin"}
         token = self.cookie_token()
         if not token:
             return None
         return self.auth_store.user_for_session(token)
+
+    def is_admin(self, user):
+        return bool(user and user.get("role") == "admin")
 
     def is_public_get(self, route):
         return route in ("/login", "/api/health", "/favicon.ico") or route.startswith("/static/")
 
     def require_user(self, route):
         if not self.auth_enabled or self.is_public_get(route):
-            return {"username": "anonymous"}
+            return {"username": "anonymous", "role": "admin"}
         user = self.current_user()
         if user:
             return user
@@ -599,6 +681,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             next_path = urllib.parse.quote(self.path or "/", safe="")
             self.send_redirect("/login?next=%s" % next_path)
         return None
+
+    def require_admin(self, user):
+        if self.is_admin(user):
+            return True
+        self.send_json({"error": "admin permission required"}, status=403)
+        return False
 
     def client_ip(self):
         forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
@@ -655,7 +743,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         )
         max_age = max(1, int((expires_at - utc_now()).total_seconds()))
         self.send_json(
-            {"ok": True, "user": {"username": user["username"]}},
+            {"ok": True, "user": {"username": user["username"], "role": user.get("role")}},
             headers={"Set-Cookie": self.cookie_header(token, max_age)},
         )
 
@@ -666,6 +754,83 @@ class DashboardHandler(BaseHTTPRequestHandler):
             {"ok": True},
             headers={"Set-Cookie": self.cookie_header("", 0)},
         )
+
+    def auth_user_payload(self, user):
+        return {"username": user.get("username"), "role": user.get("role")}
+
+    def validated_request_payload(self):
+        data = self.read_json_body(limit=32768)
+        model_name = str(data.get("model_name") or "").strip()
+        purpose = str(data.get("purpose") or "").strip()
+        if not model_name or not purpose:
+            raise ValueError("model name and purpose are required")
+        gpu_count = int(as_number(data.get("gpu_count")) or 0)
+        if gpu_count < 0 or gpu_count > 16:
+            raise ValueError("gpu count is out of range")
+        duration_hours = int(as_number(data.get("duration_hours")) or 0)
+        if duration_hours <= 0:
+            duration_hours = None
+        return {
+            "model_name": model_name[:160],
+            "model_size": str(data.get("model_size") or "").strip()[:80],
+            "purpose": purpose[:2000],
+            "access_type": str(data.get("access_type") or "ssh").strip()[:20],
+            "gpu_count": gpu_count,
+            "gpu_memory_gb": rounded(data.get("gpu_memory_gb")),
+            "duration_hours": duration_hours,
+            "notes": str(data.get("notes") or "").strip()[:3000],
+        }
+
+    def create_model_request(self, user):
+        try:
+            payload = self.validated_request_payload()
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        recommendation = self.monitor.resource_recommendation(payload)
+        request_id = self.auth_store.create_model_request(user["id"], payload, recommendation)
+        self.send_json({"ok": True, "id": request_id, "recommendation": recommendation}, status=201)
+
+    def update_model_request(self, route, user):
+        if not self.require_admin(user):
+            return
+        try:
+            request_id = int(route.split("/")[-2])
+        except Exception:
+            self.send_json({"error": "invalid request id"}, status=400)
+            return
+        data = self.read_json_body(limit=32768)
+        try:
+            updated = self.auth_store.update_model_request(
+                request_id,
+                user["id"],
+                str(data.get("status") or "").strip(),
+                admin_note=str(data.get("admin_note") or "").strip()[:3000],
+                allocation_note=str(data.get("allocation_note") or "").strip()[:3000],
+            )
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        if not updated:
+            self.send_json({"error": "request not found"}, status=404)
+            return
+        self.send_json({"ok": True, "request": updated})
+
+    def create_user(self, user):
+        if not self.require_admin(user):
+            return
+        data = self.read_json_body()
+        username = str(data.get("username") or "").strip()
+        password = str(data.get("password") or "")
+        role = str(data.get("role") or "user").strip()
+        if not username or not password:
+            self.send_json({"error": "username and password are required"}, status=400)
+            return
+        if role not in ("admin", "user"):
+            self.send_json({"error": "invalid role"}, status=400)
+            return
+        self.auth_store.set_password(username, password, role=role)
+        self.send_json({"ok": True, "user": {"username": username, "role": role}}, status=201)
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -691,10 +856,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/auth/me":
-            self.send_json({"authenticated": bool(user), "user": {"username": user.get("username")}})
+            self.send_json(
+                {
+                    "authenticated": bool(user),
+                    "auth_enabled": self.auth_enabled,
+                    "user": self.auth_user_payload(user),
+                }
+            )
+            return
+
+        if route == "/requests":
+            if not self.auth_enabled:
+                self.send_redirect("/")
+                return
+            self.send_file(STATIC_DIR / "requests.html")
+            return
+
+        if route == "/api/resource-requests":
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.send_json({"requests": self.auth_store.list_model_requests(user)})
+            return
+
+        if route == "/api/users":
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            if not self.require_admin(user):
+                return
+            self.send_json({"users": self.auth_store.list_users()})
             return
 
         if route == "/api/servers":
+            if not self.require_admin(user):
+                return
             config = self.monitor.config
             groups = sorted({server.get("group", "default") for server in self.monitor.servers})
             self.send_json(
@@ -710,11 +906,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/snapshot":
+            if not self.require_admin(user):
+                return
             force = query.get("force", ["0"])[0] == "1"
             self.send_json(self.monitor.cached_snapshot(trigger=force))
             return
 
         if route == "/api/history":
+            if not self.require_admin(user):
+                return
             self.send_json(
                 {
                     "generated_at": utc_now_iso(),
@@ -726,6 +926,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if route.startswith("/api/server/"):
+            if not self.require_admin(user):
+                return
             server_id = urllib.parse.unquote(route.rsplit("/", 1)[-1])
             server = self.monitor.get_server(server_id)
             if not server:
@@ -736,6 +938,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if route in ("", "/"):
+            if not self.is_admin(user):
+                self.send_redirect("/requests")
+                return
             self.send_file(STATIC_DIR / "index.html")
             return
 
@@ -765,6 +970,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.handle_logout()
             return
 
+        if route == "/api/resource-requests":
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.create_model_request(user)
+            return
+
+        if route.startswith("/api/resource-requests/") and route.endswith("/status"):
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.update_model_request(route, user)
+            return
+
+        if route == "/api/users":
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.create_user(user)
+            return
+
         self.send_error(404)
 
 
@@ -791,7 +1017,10 @@ def main(argv=None):
         bootstrap_user = os.getenv("PROBE_AUTH_BOOTSTRAP_USER")
         bootstrap_password = os.getenv("PROBE_AUTH_BOOTSTRAP_PASSWORD")
         if bootstrap_user and bootstrap_password:
-            auth_store.set_password(bootstrap_user, bootstrap_password)
+            bootstrap_role = os.getenv("PROBE_AUTH_BOOTSTRAP_ROLE") or auth_config.get("bootstrap_role", "admin")
+            if bootstrap_role not in ("admin", "user"):
+                bootstrap_role = "admin"
+            auth_store.set_password(bootstrap_user, bootstrap_password, role=bootstrap_role)
         DashboardHandler.auth_store = auth_store
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     print("Server probe dashboard listening on http://%s:%s" % (args.host, args.port), flush=True)
