@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Server Probe Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260609-batch1" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">SSH Probe</p>
+          <h1 id="pageTitle">Server Probe Dashboard</h1>
+        </div>
+        <div class="status-strip" aria-live="polite">
+          <div class="stat-chip"><span id="onlineCount">0</span><small>在线</small></div>
+          <div class="stat-chip warn"><span id="warnCount">0</span><small>高负载</small></div>
+          <div class="stat-chip danger"><span id="offlineCount">0</span><small>离线</small></div>
+        </div>
+      </header>
+
+      <section class="toolbar" aria-label="筛选">
+        <div class="field">
+          <label for="groupFilter">机器组</label>
+          <select id="groupFilter">
+            <option value="all">全部</option>
+          </select>
+        </div>
+        <div class="field grow">
+          <label for="searchInput">搜索</label>
+          <input id="searchInput" type="search" placeholder="IP、名称、用户" />
+        </div>
+        <div class="field">
+          <label for="sortSelect">排序</label>
+          <select id="sortSelect">
+            <option value="group">分组</option>
+            <option value="cpu">CPU</option>
+            <option value="mem">内存</option>
+            <option value="gpu">GPU</option>
+            <option value="status">状态</option>
+          </select>
+        </div>
+        <button id="refreshButton" class="button" type="button">刷新</button>
+        <label class="toggle">
+          <input id="autoRefresh" type="checkbox" checked />
+          <span>自动</span>
+        </label>
+      </section>
+
+      <main>
+        <div class="timeline">
+          <span id="lastUpdated">等待采集</span>
+          <span id="refreshState">60s 刷新</span>
+        </div>
+        <section id="alertPanel" class="alert-panel" hidden></section>
+        <section id="serverGrid" class="server-grid" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <template id="serverCardTemplate">
+      <article class="server-card">
+        <div class="card-head">
+          <div>
+            <p class="group-label"></p>
+            <h2></h2>
+            <p class="host-line"></p>
+          </div>
+          <span class="state-pill"></span>
+        </div>
+        <div class="card-alerts"></div>
+        <div class="metric-grid">
+          <div class="metric">
+            <div class="dial"><span></span></div>
+            <p>CPU</p>
+          </div>
+          <div class="metric">
+            <div class="dial"><span></span></div>
+            <p>内存</p>
+          </div>
+          <div class="metric">
+            <div class="dial"><span></span></div>
+            <p>GPU汇总</p>
+          </div>
+        </div>
+        <div class="gpu-breakdown"></div>
+        <div class="history-panel"></div>
+        <div class="gpu-users"></div>
+        <div class="quick-lines"></div>
+        <details class="process-panel">
+          <summary>Top 10 资源进程</summary>
+          <div class="tabs">
+            <button type="button" data-tab="cpu" class="active">CPU</button>
+            <button type="button" data-tab="mem">内存</button>
+            <button type="button" data-tab="gpu">GPU</button>
+            <button type="button" data-tab="gpu-user">GPU用户</button>
+          </div>
+          <div class="table-wrap"></div>
+        </details>
+      </article>
+    </template>
+
+    <script src="/static/app.js?v=20260609-batch1"></script>
+  </body>
+</html>

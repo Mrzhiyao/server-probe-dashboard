@@ -1,0 +1,51 @@
+{
+  "title": "Server Probe Dashboard",
+  "refresh_seconds": 60,
+  "cache_ttl_seconds": 60,
+  "history_retention_points": 240,
+  "alert_thresholds": {
+    "cpu_warn_percent": 85,
+    "cpu_critical_percent": 95,
+    "memory_warn_percent": 88,
+    "memory_critical_percent": 95,
+    "gpu_warn_percent": 92,
+    "gpu_critical_percent": 98,
+    "disk_warn_percent": 90,
+    "disk_critical_percent": 95
+  },
+  "connect_timeout_seconds": 7,
+  "command_timeout_seconds": 12,
+  "concurrency": 8,
+  "servers": [
+    {
+      "id": "local",
+      "name": "Local test host",
+      "group": "demo",
+      "connection": "local"
+    },
+    {
+      "id": "example-direct",
+      "name": "example-direct-host",
+      "group": "direct",
+      "host": "203.0.113.10",
+      "port": 22,
+      "user": "root",
+      "password_env": "DIRECT_SSH_PASSWORD"
+    },
+    {
+      "id": "example-jump",
+      "name": "example-jump-target",
+      "group": "jump",
+      "host": "198.51.100.20",
+      "port": 22,
+      "user": "target-user",
+      "password_env": "TARGET_SSH_PASSWORD",
+      "jump": {
+        "host": "jump.example.com",
+        "port": 2222,
+        "user": "jump-user",
+        "password_env": "JUMP_PASSWORD"
+      }
+    }
+  ]
+}

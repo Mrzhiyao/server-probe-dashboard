@@ -1,0 +1,17 @@
+{
+  "title": "Local Probe Test",
+  "refresh_seconds": 15,
+  "cache_ttl_seconds": 2,
+  "connect_timeout_seconds": 4,
+  "command_timeout_seconds": 8,
+  "concurrency": 2,
+  "servers": [
+    {
+      "id": "local",
+      "name": "Local test host",
+      "group": "local",
+      "connection": "local"
+    }
+  ]
+}
+
