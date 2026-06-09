@@ -18,6 +18,7 @@ const els = {
   searchInput: document.querySelector("#searchInput"),
   sortSelect: document.querySelector("#sortSelect"),
   refreshButton: document.querySelector("#refreshButton"),
+  logoutButton: document.querySelector("#logoutButton"),
   autoRefresh: document.querySelector("#autoRefresh"),
   lastUpdated: document.querySelector("#lastUpdated"),
   refreshState: document.querySelector("#refreshState"),
@@ -640,6 +641,10 @@ function render() {
 
 async function fetchJson(url) {
   const response = await fetch(url, { cache: "no-store" });
+  if (response.status === 401) {
+    window.location.href = `/login?next=${encodeURIComponent(window.location.pathname + window.location.search)}`;
+    throw new Error("authentication required");
+  }
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 }
@@ -697,6 +702,10 @@ function schedule() {
 }
 
 els.refreshButton.addEventListener("click", () => loadSnapshot(true));
+els.logoutButton?.addEventListener("click", async () => {
+  await fetch("/api/auth/logout", { method: "POST", cache: "no-store" }).catch(() => {});
+  window.location.href = "/login";
+});
 els.autoRefresh.addEventListener("change", schedule);
 els.groupFilter.addEventListener("change", render);
 els.searchInput.addEventListener("input", render);

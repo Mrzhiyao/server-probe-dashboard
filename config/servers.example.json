@@ -3,6 +3,12 @@
   "refresh_seconds": 60,
   "cache_ttl_seconds": 60,
   "history_retention_points": 240,
+  "auth": {
+    "enabled": false,
+    "postgres_dsn": "postgresql://server_probe:change-me@127.0.0.1:5432/server_probe",
+    "session_hours": 12,
+    "cookie_secure": false
+  },
   "alert_thresholds": {
     "cpu_warn_percent": 85,
     "cpu_critical_percent": 95,

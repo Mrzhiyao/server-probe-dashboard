@@ -11,6 +11,7 @@ A lightweight SSH-based Linux resource dashboard. The dashboard host periodicall
 - NVIDIA GPU metrics through `nvidia-smi`
 - Jetson GPU metrics through `tegrastats`
 - Direct SSH and SSH jump-host collection
+- Optional PostgreSQL-backed login and session access control
 - Secrets read from environment variables, not frontend code or API responses
 
 ## Run
@@ -34,6 +35,25 @@ DIRECT_SSH_PASSWORD=...
 TARGET_SSH_PASSWORD=...
 JUMP_PASSWORD=...
 ```
+
+## Access Control
+
+Authentication is disabled by default. To enable it, install the requirements, create a PostgreSQL database, then set:
+
+```ini
+PROBE_AUTH_ENABLED=1
+PROBE_AUTH_DB_DSN=postgresql://server_probe:change-me@127.0.0.1:5432/server_probe
+PROBE_AUTH_SESSION_HOURS=12
+```
+
+Initialize the auth tables and create an admin user:
+
+```bash
+python -m server_probe.auth init-db
+python -m server_probe.auth set-password admin
+```
+
+Use HTTPS in front of the dashboard when exposing it beyond a trusted LAN.
 
 ## systemd
 

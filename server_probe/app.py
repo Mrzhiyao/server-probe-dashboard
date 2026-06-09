@@ -2,6 +2,7 @@
 """Small HTTP dashboard that collects Linux metrics over SSH."""
 
 import argparse
+import http.cookies
 import json
 import mimetypes
 import os
@@ -18,10 +19,13 @@ from pathlib import Path
 
 import paramiko
 
+from server_probe.auth import AuthStore, utc_now
+
 
 APP_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = APP_DIR / "static"
 COLLECTOR_PATH = APP_DIR / "server_probe" / "collector.py"
+SESSION_COOKIE = "probe_session"
 
 
 def utc_now_iso():
@@ -42,6 +46,13 @@ def rounded(value):
     if number is None:
         return None
     return round(number, 1)
+
+
+def env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def public_server(server):
@@ -490,15 +501,22 @@ def load_config(path):
 
 class DashboardHandler(BaseHTTPRequestHandler):
     monitor = None
+    auth_enabled = False
+    auth_store = None
+    cookie_secure = False
+    login_lock = threading.Lock()
+    login_failures = {}
 
     def log_message(self, format, *args):
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), format % args))
 
-    def send_json(self, payload, status=200):
+    def send_json(self, payload, status=200, headers=None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -514,6 +532,141 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_redirect(self, location):
+        body = b""
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def read_json_body(self, limit=16384):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except Exception:
+            length = 0
+        if length <= 0 or length > limit:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return {}
+
+    def cookie_token(self):
+        raw = self.headers.get("Cookie", "")
+        if not raw:
+            return ""
+        try:
+            cookies = http.cookies.SimpleCookie(raw)
+            morsel = cookies.get(SESSION_COOKIE)
+            return morsel.value if morsel else ""
+        except Exception:
+            return ""
+
+    def cookie_header(self, token, max_age):
+        parts = [
+            "%s=%s" % (SESSION_COOKIE, token),
+            "Path=/",
+            "Max-Age=%s" % int(max_age),
+            "HttpOnly",
+            "SameSite=Lax",
+        ]
+        if self.cookie_secure:
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def current_user(self):
+        if not self.auth_enabled:
+            return {"username": "anonymous"}
+        token = self.cookie_token()
+        if not token:
+            return None
+        return self.auth_store.user_for_session(token)
+
+    def is_public_get(self, route):
+        return route in ("/login", "/api/health", "/favicon.ico") or route.startswith("/static/")
+
+    def require_user(self, route):
+        if not self.auth_enabled or self.is_public_get(route):
+            return {"username": "anonymous"}
+        user = self.current_user()
+        if user:
+            return user
+        if route.startswith("/api/"):
+            self.send_json({"error": "authentication required"}, status=401)
+        else:
+            next_path = urllib.parse.quote(self.path or "/", safe="")
+            self.send_redirect("/login?next=%s" % next_path)
+        return None
+
+    def client_ip(self):
+        forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+        return forwarded or self.client_address[0]
+
+    def login_key(self, username):
+        return "%s:%s" % (self.client_ip(), (username or "").strip().lower())
+
+    def login_limited(self, username):
+        key = self.login_key(username)
+        now = time.time()
+        with self.login_lock:
+            values = [value for value in self.login_failures.get(key, []) if now - value < 600]
+            self.login_failures[key] = values
+            return len(values) >= 5
+
+    def record_login_failure(self, username):
+        key = self.login_key(username)
+        now = time.time()
+        with self.login_lock:
+            values = [value for value in self.login_failures.get(key, []) if now - value < 600]
+            values.append(now)
+            self.login_failures[key] = values
+
+    def clear_login_failures(self, username):
+        with self.login_lock:
+            self.login_failures.pop(self.login_key(username), None)
+
+    def handle_login(self):
+        if not self.auth_enabled:
+            self.send_json({"ok": True, "auth_enabled": False})
+            return
+        data = self.read_json_body()
+        username = str(data.get("username") or "").strip()
+        password = str(data.get("password") or "")
+        if not username or not password:
+            self.send_json({"error": "username and password are required"}, status=400)
+            return
+        if self.login_limited(username):
+            self.send_json({"error": "too many failed login attempts"}, status=429)
+            return
+
+        user = self.auth_store.verify_user(username, password)
+        if not user:
+            self.record_login_failure(username)
+            self.send_json({"error": "invalid username or password"}, status=401)
+            return
+
+        self.clear_login_failures(username)
+        token, expires_at = self.auth_store.create_session(
+            user["id"],
+            ip_address=self.client_ip(),
+            user_agent=self.headers.get("User-Agent", ""),
+        )
+        max_age = max(1, int((expires_at - utc_now()).total_seconds()))
+        self.send_json(
+            {"ok": True, "user": {"username": user["username"]}},
+            headers={"Set-Cookie": self.cookie_header(token, max_age)},
+        )
+
+    def handle_logout(self):
+        if self.auth_enabled:
+            self.auth_store.destroy_session(self.cookie_token())
+        self.send_json(
+            {"ok": True},
+            headers={"Set-Cookie": self.cookie_header("", 0)},
+        )
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         route = parsed.path
@@ -521,6 +674,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if route == "/api/health":
             self.send_json({"ok": True, "time": utc_now_iso()})
+            return
+
+        if route == "/login":
+            if self.auth_enabled and self.current_user():
+                next_path = query.get("next", ["/"])[0] or "/"
+                if not next_path.startswith("/"):
+                    next_path = "/"
+                self.send_redirect(next_path)
+                return
+            self.send_file(STATIC_DIR / "login.html")
+            return
+
+        user = self.require_user(route)
+        if user is None:
+            return
+
+        if route == "/api/auth/me":
+            self.send_json({"authenticated": bool(user), "user": {"username": user.get("username")}})
             return
 
         if route == "/api/servers":
@@ -578,6 +749,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         self.send_error(404)
 
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        route = parsed.path
+
+        if route == "/api/auth/login":
+            self.handle_login()
+            return
+
+        user = self.require_user(route)
+        if user is None:
+            return
+
+        if route == "/api/auth/logout":
+            self.handle_logout()
+            return
+
+        self.send_error(404)
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="SSH server resource dashboard")
@@ -588,6 +777,22 @@ def main(argv=None):
 
     config = load_config(args.config)
     DashboardHandler.monitor = Monitor(config)
+    auth_config = config.get("auth") or {}
+    auth_enabled = env_bool("PROBE_AUTH_ENABLED", bool(auth_config.get("enabled", False)))
+    DashboardHandler.auth_enabled = auth_enabled
+    DashboardHandler.cookie_secure = env_bool("PROBE_AUTH_COOKIE_SECURE", bool(auth_config.get("cookie_secure", False)))
+    if auth_enabled:
+        dsn = os.getenv("PROBE_AUTH_DB_DSN") or auth_config.get("postgres_dsn")
+        if not dsn:
+            raise RuntimeError("PROBE_AUTH_DB_DSN is required when authentication is enabled")
+        session_hours = int(os.getenv("PROBE_AUTH_SESSION_HOURS", auth_config.get("session_hours", 12)))
+        auth_store = AuthStore(dsn, session_hours=session_hours)
+        auth_store.setup()
+        bootstrap_user = os.getenv("PROBE_AUTH_BOOTSTRAP_USER")
+        bootstrap_password = os.getenv("PROBE_AUTH_BOOTSTRAP_PASSWORD")
+        if bootstrap_user and bootstrap_password:
+            auth_store.set_password(bootstrap_user, bootstrap_password)
+        DashboardHandler.auth_store = auth_store
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     print("Server probe dashboard listening on http://%s:%s" % (args.host, args.port), flush=True)
     server.serve_forever()

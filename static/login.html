@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Login - Server Probe Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260609-auth" />
+  </head>
+  <body class="auth-body">
+    <main class="auth-shell">
+      <section class="auth-panel">
+        <p class="eyebrow">SSH Probe</p>
+        <h1>Server Probe Dashboard</h1>
+        <form id="loginForm" class="login-form">
+          <label>
+            用户名
+            <input id="username" name="username" type="text" autocomplete="username" required autofocus />
+          </label>
+          <label>
+            密码
+            <input id="password" name="password" type="password" autocomplete="current-password" required />
+          </label>
+          <button id="loginButton" class="button" type="submit">登录</button>
+          <p id="loginError" class="login-error" role="alert"></p>
+        </form>
+      </section>
+    </main>
+    <script src="/static/login.js?v=20260609-auth"></script>
+  </body>
+</html>
