@@ -100,6 +100,7 @@ ACCOUNT_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 REMOTE_PROVISIONER = r'''
 import datetime
+import glob
 import json
 import os
 import pwd
@@ -134,6 +135,16 @@ def user_exists(username):
         return False
 
 
+def discover_disk_paths():
+    paths = []
+    for path in glob.glob("/disk_*"):
+        if os.path.isdir(path):
+            paths.append(path)
+    if os.path.isdir("/disk_n"):
+        paths.append("/disk_n")
+    return sorted(set(paths))
+
+
 payload = json.loads(__PAYLOAD_JSON__)
 username = str(payload.get("username") or "").strip()
 password = str(payload.get("password") or "")
@@ -161,6 +172,16 @@ run(command)
 created = True
 try:
     run(["chpasswd"], "%s:%s\n" % (username, password))
+    run(["usermod", "-s", "/bin/bash", username])
+    run(["groupadd", "-f", "docker"])
+    run(["usermod", "-aG", "docker", username])
+    disk_paths = discover_disk_paths()
+    if disk_paths:
+        run(["groupadd", "-f", "diskusers"])
+        for disk_path in disk_paths:
+            run(["chgrp", "diskusers", disk_path])
+            run(["chmod", "775", disk_path])
+        run(["usermod", "-aG", "diskusers", username])
     run(["chage", "-M", "99999", username], check=False)
     schedule = {"method": None, "ok": False, "message": ""}
     if temporary and expires_at:
@@ -196,7 +217,16 @@ try:
             }
         else:
             schedule = {"method": "chage", "ok": False, "message": "delete scheduler unavailable; account expiry was set"}
-    print(json.dumps({"ok": True, "username": username, "temporary": temporary, "expiry_date": expiry_date, "delete_schedule": schedule}))
+    print(json.dumps({
+        "ok": True,
+        "username": username,
+        "temporary": temporary,
+        "expiry_date": expiry_date,
+        "groups_added": ["docker"] + (["diskusers"] if disk_paths else []),
+        "disk_paths": disk_paths,
+        "shell": "/bin/bash",
+        "delete_schedule": schedule,
+    }))
 except Exception:
     if created:
         run(["userdel", "-r", username], check=False)
@@ -1233,6 +1263,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         schedule = result.get("delete_schedule") or {}
         if schedule.get("method"):
             values.append("delete_schedule=%s:%s" % (schedule.get("method"), "ok" if schedule.get("ok") else "needs-check"))
+        groups = result.get("groups_added") or []
+        if groups:
+            values.append("groups=%s" % ",".join(groups))
+        disk_paths = result.get("disk_paths") or []
+        if disk_paths:
+            values.append("disk_paths=%s" % ",".join(disk_paths))
         return "\n".join(values)
 
     def provision_request_account(self, route, user):
@@ -1270,7 +1306,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 machine_key=payload["target_machine"],
                 machine_label=payload["target_machine_label"],
                 source="temporary-provision" if payload["account_type"] == "temporary" else "admin-provision",
-                metadata={"request_id": request_id, "expires_at": payload.get("expires_at")},
+                metadata={
+                    "request_id": request_id,
+                    "expires_at": payload.get("expires_at"),
+                    "groups": result.get("groups_added") or [],
+                    "disk_paths": result.get("disk_paths") or [],
+                    "shell": result.get("shell"),
+                },
             )
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
@@ -1299,7 +1341,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 machine_key=payload["target_machine"],
                 machine_label=payload["target_machine_label"],
                 source="temporary-provision" if payload["account_type"] == "temporary" else "admin-provision",
-                metadata={"expires_at": payload.get("expires_at"), "created_by": user.get("username")},
+                metadata={
+                    "expires_at": payload.get("expires_at"),
+                    "created_by": user.get("username"),
+                    "groups": result.get("groups_added") or [],
+                    "disk_paths": result.get("disk_paths") or [],
+                    "shell": result.get("shell"),
+                },
             )
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
