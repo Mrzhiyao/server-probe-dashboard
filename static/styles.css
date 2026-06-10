@@ -18,6 +18,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   min-height: 100vh;
@@ -166,6 +170,11 @@ summary:focus-visible {
   border: 1px solid var(--line);
   background: #111315;
   color: var(--text);
+}
+
+.button.danger {
+  border-color: rgba(255, 128, 128, 0.5);
+  color: #ff9b9b;
 }
 
 .link-button {
@@ -659,9 +668,18 @@ textarea:focus {
 
 .decision-form {
   display: grid;
-  grid-template-columns: 140px minmax(0, 1fr) minmax(0, 1fr) auto;
+  grid-template-columns: 140px auto minmax(0, 1fr) minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
+}
+
+.decision-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.decision-actions .button {
+  min-width: 72px;
 }
 
 .provision-form {

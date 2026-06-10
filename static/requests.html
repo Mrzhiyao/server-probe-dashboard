@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Request Center - Server Probe Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260610-provision" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260610-approval" />
   </head>
   <body>
     <div class="app-shell">
@@ -118,7 +118,7 @@
               <div class="form-grid">
                 <label>账号名 <input name="username" autocomplete="off" placeholder="留空则自动生成" /></label>
                 <label>密码 <input name="password" type="password" autocomplete="new-password" placeholder="留空则自动生成" /></label>
-                <label>临时账号时长 小时 <input name="duration_hours" type="number" min="1" step="1" value="24" /></label>
+                <label data-duration-field>临时账号时长 小时 <input name="duration_hours" type="number" min="1" step="1" value="24" /></label>
               </div>
               <button class="button" type="submit">创建机器账号</button>
               <p id="directProvisionMessage" class="form-message"></p>
@@ -149,6 +149,6 @@
         </section>
       </main>
     </div>
-    <script src="/static/requests.js?v=20260610-provision"></script>
+    <script src="/static/requests.js?v=20260610-approval"></script>
   </body>
 </html>

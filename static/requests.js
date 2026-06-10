@@ -182,6 +182,10 @@ function adminControls(request) {
         .map((status) => `<option value="${status}"${request.status === status ? " selected" : ""}>${statusText(status)}</option>`)
         .join("")}
     </select>
+    <div class="decision-actions">
+      <button class="button ghost decision-quick" type="button" data-status="approved">通过</button>
+      <button class="button ghost danger decision-quick" type="button" data-status="rejected">拒绝</button>
+    </div>
     <input name="allocation_note" placeholder="分配说明，如机器/账号/到期时间" value="${escapeHtml(request.allocation_note || "")}" />
     <input name="admin_note" placeholder="管理员备注" value="${escapeHtml(request.admin_note || "")}" />
     <button class="button" type="submit">保存</button>
@@ -267,8 +271,7 @@ function renderRequests() {
   els.requestListTitle.textContent = state.user?.role === "admin" ? "申请审批" : "我的申请";
   els.requestList.innerHTML = state.requests.length ? state.requests.map(requestCard).join("") : `<div class="empty">暂无申请</div>`;
   document.querySelectorAll(".decision-form").forEach((form) => {
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
+    const saveDecision = async () => {
       const payload = formPayload(form);
       await fetchJson(`/api/resource-requests/${form.dataset.id}/status`, {
         method: "POST",
@@ -276,6 +279,16 @@ function renderRequests() {
         body: JSON.stringify(payload),
       });
       await loadRequests();
+    };
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await saveDecision();
+    });
+    form.querySelectorAll(".decision-quick").forEach((button) => {
+      button.addEventListener("click", async () => {
+        form.elements.status.value = button.dataset.status;
+        await saveDecision();
+      });
     });
   });
   document.querySelectorAll(".provision-form").forEach((form) => {
@@ -333,6 +346,18 @@ async function loadUsers() {
 function showMessage(element, message, isError = false) {
   element.innerHTML = message;
   element.classList.toggle("error", isError);
+}
+
+function syncDirectProvisionDuration() {
+  const type = els.directProvisionForm.elements.account_type.value;
+  const field = els.directProvisionForm.querySelector("[data-duration-field]");
+  const input = els.directProvisionForm.elements.duration_hours;
+  const isTemporary = type === "temporary";
+  field.hidden = !isTemporary;
+  input.disabled = !isTemporary;
+  input.required = isTemporary;
+  if (isTemporary && !input.value) input.value = "24";
+  if (!isTemporary) input.value = "";
 }
 
 async function submitRequest(form, requestType, messageElement) {
@@ -440,11 +465,13 @@ els.directProvisionForm.addEventListener("submit", async (event) => {
     ].filter(Boolean);
     showMessage(els.directProvisionMessage, escapeHtml(lines.join("\n")).replaceAll("\n", "<br />"));
     els.directProvisionForm.reset();
+    syncDirectProvisionDuration();
   } catch (error) {
     showMessage(els.directProvisionMessage, escapeHtml(error.message || "创建失败"), true);
   }
 });
 
+els.directProvisionForm.elements.account_type.addEventListener("change", syncDirectProvisionDuration);
 els.reloadButton.addEventListener("click", loadRequests);
 els.logoutButton.addEventListener("click", async () => {
   await fetch("/api/auth/logout", { method: "POST", cache: "no-store" }).catch(() => {});
@@ -452,6 +479,7 @@ els.logoutButton.addEventListener("click", async () => {
 });
 
 setKind("temporary");
+syncDirectProvisionDuration();
 start().catch((error) => {
   els.requestList.innerHTML = `<div class="error-box">${escapeHtml(error.message)}</div>`;
 });
