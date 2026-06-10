@@ -7,13 +7,17 @@ import json
 import mimetypes
 import os
 import posixpath
+import random
+import re
+import secrets
+import string
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -46,6 +50,13 @@ def rounded(value):
     if number is None:
         return None
     return round(number, 1)
+
+
+def int_or_none(value):
+    number = as_number(value)
+    if number is None:
+        return None
+    return int(number)
 
 
 def env_bool(name, default=False):
@@ -84,6 +95,130 @@ def request_machine(server):
     }
 
 
+ACCOUNT_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+
+REMOTE_PROVISIONER = r'''
+import datetime
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+
+
+ACCOUNT_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+
+def run(command, input_text=None, check=True):
+    completed = subprocess.run(
+        command,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if check and completed.returncode != 0:
+        raise RuntimeError((completed.stderr or completed.stdout or "command failed").strip())
+    return completed
+
+
+def user_exists(username):
+    try:
+        pwd.getpwnam(username)
+        return True
+    except KeyError:
+        return False
+
+
+payload = json.loads(__PAYLOAD_JSON__)
+username = str(payload.get("username") or "").strip()
+password = str(payload.get("password") or "")
+temporary = bool(payload.get("temporary"))
+expires_at = payload.get("expires_at") or ""
+delete_at = None
+
+if os.geteuid() != 0:
+    raise SystemExit("root permission is required")
+if not ACCOUNT_NAME_RE.match(username):
+    raise SystemExit("invalid account name")
+if "\n" in password or "\r" in password or not password:
+    raise SystemExit("invalid password")
+if user_exists(username):
+    raise SystemExit("account already exists")
+
+command = ["useradd", "-m", "-s", "/bin/bash"]
+expiry_date = ""
+if temporary and expires_at:
+    delete_at = datetime.datetime.fromisoformat(expires_at.replace("Z", "+00:00")).astimezone()
+    expiry_date = delete_at.strftime("%Y-%m-%d")
+    command.extend(["-e", expiry_date])
+command.append(username)
+run(command)
+created = True
+try:
+    run(["chpasswd"], "%s:%s\n" % (username, password))
+    run(["chage", "-M", "99999", username], check=False)
+    schedule = {"method": None, "ok": False, "message": ""}
+    if temporary and expires_at:
+        delete_command = "userdel -r %s" % username
+        local_delete_time = delete_at.strftime("%Y-%m-%d %H:%M:%S") if delete_at else expires_at.replace("T", " ")[:19]
+        if shutil.which("systemd-run"):
+            unit = "server-probe-delete-%s" % username
+            completed = run(
+                [
+                    "systemd-run",
+                    "--quiet",
+                    "--unit",
+                    unit,
+                    "--on-calendar",
+                    local_delete_time,
+                    "/usr/sbin/userdel",
+                    "-r",
+                    username,
+                ],
+                check=False,
+            )
+            schedule = {
+                "method": "systemd-run",
+                "ok": completed.returncode == 0,
+                "message": (completed.stderr or completed.stdout or "").strip(),
+            }
+        elif shutil.which("at"):
+            completed = run(["at", local_delete_time[:16]], input_text=delete_command + "\n", check=False)
+            schedule = {
+                "method": "at",
+                "ok": completed.returncode == 0,
+                "message": (completed.stderr or completed.stdout or "").strip(),
+            }
+        else:
+            schedule = {"method": "chage", "ok": False, "message": "delete scheduler unavailable; account expiry was set"}
+    print(json.dumps({"ok": True, "username": username, "temporary": temporary, "expiry_date": expiry_date, "delete_schedule": schedule}))
+except Exception:
+    if created:
+        run(["userdel", "-r", username], check=False)
+    raise
+'''
+
+
+def generated_password(length=18):
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def generated_account_name(prefix="sp"):
+    suffix = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+    return "%s-%s" % (prefix, suffix)
+
+
+def safe_account_name(value):
+    username = str(value or "").strip()
+    return username if ACCOUNT_NAME_RE.match(username) else ""
+
+
 class Monitor:
     def __init__(self, config):
         self.config = config
@@ -112,7 +247,8 @@ class Monitor:
     def _load_known_secrets(self):
         values = []
         for server in self.servers:
-            for item in (server, server.get("jump") or {}):
+            provision = server.get("provision") or {}
+            for item in (server, server.get("jump") or {}, provision, provision.get("jump") or {}):
                 password = item.get("password")
                 if password:
                     values.append(str(password))
@@ -143,6 +279,10 @@ class Monitor:
             if server["id"] == server_id:
                 return server
         return None
+
+    def server_timeout(self, server, key, default):
+        value = as_number(server.get(key))
+        return float(value) if value is not None and value > 0 else default
 
     def request_machines(self):
         return [request_machine(server) for server in self.servers]
@@ -528,6 +668,7 @@ class Monitor:
                     port=int(jump.get("port", 22)),
                     user=jump["user"],
                     password=self.resolve_password(jump),
+                    timeout=self.server_timeout(jump, "connect_timeout_seconds", self.connect_timeout),
                 )
                 transport = jump_client.get_transport()
                 sock = transport.open_channel(
@@ -542,8 +683,9 @@ class Monitor:
                 user=server["user"],
                 password=self.resolve_password(server),
                 sock=sock,
+                timeout=self.server_timeout(server, "connect_timeout_seconds", self.connect_timeout),
             )
-            output = self.run_remote_collector(client)
+            output = self.run_remote_collector(client, timeout=self.server_timeout(server, "command_timeout_seconds", self.command_timeout))
             return json.loads(output)
         finally:
             if client is not None:
@@ -551,26 +693,28 @@ class Monitor:
             if jump_client is not None:
                 jump_client.close()
 
-    def open_client(self, host, port, user, password, sock=None):
+    def open_client(self, host, port, user, password, sock=None, timeout=None):
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        timeout = self.connect_timeout if timeout is None else timeout
         client.connect(
             hostname=host,
             port=port,
             username=user,
             password=password,
             sock=sock,
-            timeout=self.connect_timeout,
-            banner_timeout=self.connect_timeout,
-            auth_timeout=self.connect_timeout,
+            timeout=timeout,
+            banner_timeout=timeout,
+            auth_timeout=timeout,
             look_for_keys=False,
             allow_agent=False,
         )
         return client
 
-    def run_remote_collector(self, client):
+    def run_remote_collector(self, client, timeout=None):
+        timeout = self.command_timeout if timeout is None else timeout
         command = "sh -lc 'if command -v python3 >/dev/null 2>&1; then exec python3 -; else exec python -; fi'"
-        stdin, stdout, stderr = client.exec_command(command, timeout=self.command_timeout)
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
         stdin.write(self.collector_source)
         stdin.channel.shutdown_write()
         out = stdout.read().decode("utf-8", "replace")
@@ -581,6 +725,132 @@ class Monitor:
         if not out.strip():
             raise RuntimeError("remote collector returned empty output")
         return out.strip()
+
+    def provision_target(self, server):
+        provision = server.get("provision") or {}
+        if not provision:
+            return server
+        if provision.get("enabled") is False:
+            raise RuntimeError("account provisioning is disabled for this machine")
+        target = {**server}
+        for key in (
+            "connection",
+            "host",
+            "port",
+            "user",
+            "password",
+            "password_env",
+            "connect_timeout_seconds",
+            "command_timeout_seconds",
+        ):
+            if key in provision:
+                target[key] = provision[key]
+        if "jump" in provision:
+            target["jump"] = provision["jump"]
+        return target
+
+    def run_local_provisioner(self, payload):
+        script = REMOTE_PROVISIONER.replace("__PAYLOAD_JSON__", json.dumps(json.dumps(payload)))
+        completed = subprocess.run(
+            [sys.executable, "-"],
+            input=script + "\n",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=60,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(self.redact((completed.stderr or completed.stdout or "account provisioning failed").strip()))
+        return json.loads(completed.stdout.strip().splitlines()[-1])
+
+    def run_remote_provisioner(self, server, payload):
+        target = self.provision_target(server)
+        if target.get("connection") == "local":
+            return self.run_local_provisioner(payload)
+
+        jump_client = None
+        client = None
+        try:
+            sock = None
+            if target.get("jump"):
+                jump = target["jump"]
+                jump_client = self.open_client(
+                    host=jump["host"],
+                    port=int(jump.get("port", 22)),
+                    user=jump["user"],
+                    password=self.resolve_password(jump),
+                    timeout=self.server_timeout(jump, "connect_timeout_seconds", self.connect_timeout),
+                )
+                transport = jump_client.get_transport()
+                sock = transport.open_channel(
+                    "direct-tcpip",
+                    (target["host"], int(target.get("port", 22))),
+                    ("127.0.0.1", 0),
+                )
+
+            client = self.open_client(
+                host=target["host"],
+                port=int(target.get("port", 22)),
+                user=target["user"],
+                password=self.resolve_password(target),
+                sock=sock,
+                timeout=self.server_timeout(target, "connect_timeout_seconds", self.connect_timeout),
+            )
+            return self.execute_provisioner(client, self.resolve_password(target), payload, timeout=60)
+        finally:
+            if client is not None:
+                client.close()
+            if jump_client is not None:
+                jump_client.close()
+
+    def execute_provisioner(self, client, ssh_password, payload, timeout=60):
+        check_stdin, check_stdout, check_stderr = client.exec_command("id -u", timeout=10)
+        uid_out = check_stdout.read().decode("utf-8", "replace").strip()
+        check_stderr.read()
+        check_stdout.channel.recv_exit_status()
+        is_root = uid_out == "0"
+        needs_sudo_password = False
+        if is_root:
+            command = "sh -lc 'if command -v python3 >/dev/null 2>&1; then exec python3 -; else exec python -; fi'"
+        else:
+            probe_stdin, probe_stdout, probe_stderr = client.exec_command("sudo -n true", timeout=10)
+            probe_stdout.read()
+            probe_stderr.read()
+            sudo_without_password = probe_stdout.channel.recv_exit_status() == 0
+            needs_sudo_password = not sudo_without_password
+            command = (
+                "sh -lc 'if command -v sudo >/dev/null 2>&1; then "
+                "if command -v python3 >/dev/null 2>&1; then exec sudo -S -p \"\" python3 -; else exec sudo -S -p \"\" python -; fi; "
+                "else echo root or sudo required >&2; exit 1; fi'"
+            )
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        if needs_sudo_password and ssh_password:
+            stdin.write(str(ssh_password) + "\n")
+        script = REMOTE_PROVISIONER.replace("__PAYLOAD_JSON__", json.dumps(json.dumps(payload)))
+        stdin.write(script)
+        stdin.write("\n")
+        stdin.channel.shutdown_write()
+        out = stdout.read().decode("utf-8", "replace")
+        err = stderr.read().decode("utf-8", "replace")
+        code = stdout.channel.recv_exit_status()
+        if code != 0:
+            raise RuntimeError(self.redact(err.strip() or out.strip() or "account provisioning failed"))
+        return json.loads(out.strip().splitlines()[-1])
+
+    def provision_account(self, server_id, username, password, temporary=False, expires_at=None):
+        server = self.get_server(server_id)
+        if not server:
+            raise ValueError("target machine not found")
+        payload = {
+            "username": username,
+            "password": password,
+            "temporary": bool(temporary),
+            "expires_at": expires_at,
+        }
+        result = self.run_remote_provisioner(server, payload)
+        result["server_id"] = server_id
+        result["server_name"] = server.get("name") or server_id
+        return result
 
 
 def load_config(path):
@@ -910,6 +1180,147 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.auth_store.set_password(username, password, role=role, display_name=display_name or None)
         self.send_json({"ok": True, "user": {"username": username, "role": role, "display_name": display_name}}, status=201)
 
+    def provision_payload(self, data, request=None):
+        account_type = str(data.get("account_type") or data.get("request_type") or (request or {}).get("request_type") or "temporary").strip()
+        if account_type not in ("temporary", "access"):
+            raise ValueError("invalid account type")
+        target_machine = str(data.get("target_machine") or (request or {}).get("target_machine") or "").strip()
+        if not target_machine and request and account_type == "temporary":
+            candidates = ((request.get("recommendation") or {}).get("candidates") or [])
+            if candidates:
+                target_machine = str(candidates[0].get("server_id") or "").strip()
+        if not target_machine:
+            raise ValueError("target machine is required")
+
+        username = safe_account_name(data.get("username") or (request or {}).get("requested_account"))
+        if not username:
+            prefix = "tmp" if account_type == "temporary" else "user"
+            username = generated_account_name(prefix)
+        password = str(data.get("password") or (request or {}).get("requested_password") or "").strip()
+        if not password:
+            password = generated_password()
+        if "\n" in password or "\r" in password:
+            raise ValueError("invalid password")
+
+        duration_hours = int_or_none(data.get("duration_hours"))
+        if duration_hours is None:
+            duration_hours = int_or_none((request or {}).get("duration_hours"))
+        expires_at = None
+        if account_type == "temporary":
+            if duration_hours is None or duration_hours <= 0:
+                raise ValueError("duration is required for temporary accounts")
+            expires_at = (utc_now() + timedelta(hours=duration_hours)).isoformat()
+
+        return {
+            "account_type": account_type,
+            "target_machine": target_machine,
+            "target_machine_label": self.monitor.request_machine_label(target_machine),
+            "username": username,
+            "password": password,
+            "duration_hours": duration_hours,
+            "expires_at": expires_at,
+            "owner_name": str(data.get("owner_name") or (request or {}).get("owner_name") or (request or {}).get("requester_display_name") or "").strip()[:80],
+        }
+
+    def allocation_note(self, payload, result):
+        values = [
+            "machine=%s" % payload["target_machine_label"],
+            "account=%s" % payload["username"],
+            "password=%s" % payload["password"],
+        ]
+        if payload.get("expires_at"):
+            values.append("expires_at=%s" % payload["expires_at"])
+        schedule = result.get("delete_schedule") or {}
+        if schedule.get("method"):
+            values.append("delete_schedule=%s:%s" % (schedule.get("method"), "ok" if schedule.get("ok") else "needs-check"))
+        return "\n".join(values)
+
+    def provision_request_account(self, route, user):
+        if not self.require_admin(user):
+            return
+        try:
+            request_id = int(route.split("/")[-2])
+        except Exception:
+            self.send_json({"error": "invalid request id"}, status=400)
+            return
+        request = self.auth_store.get_model_request(request_id, include_secret=True)
+        if not request:
+            self.send_json({"error": "request not found"}, status=404)
+            return
+        data = self.read_json_body(limit=32768)
+        try:
+            payload = self.provision_payload(data, request=request)
+            result = self.monitor.provision_account(
+                payload["target_machine"],
+                payload["username"],
+                payload["password"],
+                temporary=payload["account_type"] == "temporary",
+                expires_at=payload.get("expires_at"),
+            )
+            updated = self.auth_store.update_model_request(
+                request_id,
+                user["id"],
+                "allocated",
+                admin_note=str(data.get("admin_note") or request.get("admin_note") or "").strip()[:3000],
+                allocation_note=self.allocation_note(payload, result),
+            )
+            self.auth_store.upsert_machine_account(
+                payload["username"],
+                display_name=payload.get("owner_name") or request.get("requester_display_name") or "",
+                machine_key=payload["target_machine"],
+                machine_label=payload["target_machine_label"],
+                source="temporary-provision" if payload["account_type"] == "temporary" else "admin-provision",
+                metadata={"request_id": request_id, "expires_at": payload.get("expires_at")},
+            )
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        except Exception as exc:
+            self.send_json({"error": self.monitor.redact(str(exc)) or "account provisioning failed"}, status=500)
+            return
+        self.send_json({"ok": True, "provision": result, "request": updated})
+
+    def provision_direct_account(self, user):
+        if not self.require_admin(user):
+            return
+        data = self.read_json_body(limit=32768)
+        try:
+            payload = self.provision_payload(data)
+            result = self.monitor.provision_account(
+                payload["target_machine"],
+                payload["username"],
+                payload["password"],
+                temporary=payload["account_type"] == "temporary",
+                expires_at=payload.get("expires_at"),
+            )
+            self.auth_store.upsert_machine_account(
+                payload["username"],
+                display_name=payload.get("owner_name") or "",
+                machine_key=payload["target_machine"],
+                machine_label=payload["target_machine_label"],
+                source="temporary-provision" if payload["account_type"] == "temporary" else "admin-provision",
+                metadata={"expires_at": payload.get("expires_at"), "created_by": user.get("username")},
+            )
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        except Exception as exc:
+            self.send_json({"error": self.monitor.redact(str(exc)) or "account provisioning failed"}, status=500)
+            return
+        self.send_json(
+            {
+                "ok": True,
+                "provision": result,
+                "account": {
+                    "machine": payload["target_machine_label"],
+                    "username": payload["username"],
+                    "password": payload["password"],
+                    "expires_at": payload.get("expires_at"),
+                },
+            },
+            status=201,
+        )
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         route = parsed.path
@@ -1067,6 +1478,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "authentication is disabled"}, status=404)
                 return
             self.update_model_request(route, user)
+            return
+
+        if route.startswith("/api/resource-requests/") and route.endswith("/provision"):
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.provision_request_account(route, user)
+            return
+
+        if route == "/api/provision-account":
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.provision_direct_account(user)
             return
 
         if route == "/api/users":

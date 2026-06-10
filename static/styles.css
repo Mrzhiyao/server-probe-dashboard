@@ -664,6 +664,13 @@ textarea:focus {
   align-items: center;
 }
 
+.provision-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.2fr) minmax(120px, 0.8fr) minmax(120px, 0.8fr) minmax(90px, 0.45fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
 .alert-panel {
   margin: 0 0 16px;
   padding: 14px 16px;
@@ -1216,7 +1223,8 @@ td.command {
 
   .compact-form,
   .form-grid,
-  .decision-form {
+  .decision-form,
+  .provision-form {
     grid-template-columns: 1fr;
   }
 }

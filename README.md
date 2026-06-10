@@ -57,7 +57,24 @@ python -m server_probe.auth set-password alice --role user --display-name "Alice
 
 Use HTTPS in front of the dashboard when exposing it beyond a trusted LAN.
 
-Logged-in users can submit requests from `/requests`. Normal users see a submit page and their own request list. Admins see an approval page and an account-management page. Temporary account requests use the current dashboard snapshot to recommend machines. Long-term access requests can be checked against an imported machine-account index before duplicate requests are created.
+Logged-in users can submit requests from `/requests`. Normal users see a submit page and their own request list. Admins see an approval page and an account-management page. Temporary account requests use the current dashboard snapshot to recommend machines. Long-term access requests can be checked against an imported machine-account index before duplicate requests are created. Admins can provision machine accounts from an approved request or directly from the account-management page when the monitored SSH user, or the optional `provision` SSH user, is root or has sudo permission.
+
+Slow targets can override the global SSH command timeout in their server entry:
+
+```json
+{
+  "id": "large-gpu-host",
+  "host": "example.internal",
+  "user": "collector",
+  "command_timeout_seconds": 45,
+  "provision": {
+    "user": "root",
+    "password_env": "LARGE_GPU_ROOT_PASSWORD"
+  }
+}
+```
+
+The optional `provision` block inherits the host, port, and jump-host settings from the server entry unless overridden.
 
 Existing user and machine-account inventories can be imported from JSON without committing private data:
 

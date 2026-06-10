@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Request Center - Server Probe Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260610-access" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260610-provision" />
   </head>
   <body>
     <div class="app-shell">
@@ -100,6 +100,33 @@
         <section id="accountsPage" class="page-view" hidden>
           <section class="request-panel wide">
             <div class="panel-head">
+              <h2>开通机器账号</h2>
+              <span>管理员主动创建临时或长期机器账号</span>
+            </div>
+            <form id="directProvisionForm" class="request-form">
+              <div class="form-grid">
+                <label>
+                  类型
+                  <select name="account_type">
+                    <option value="temporary">临时账号</option>
+                    <option value="access">长期账号</option>
+                  </select>
+                </label>
+                <label>姓名 <input name="owner_name" /></label>
+                <label>目标机器 <select name="target_machine" data-machine-select required><option value="">请选择机器</option></select></label>
+              </div>
+              <div class="form-grid">
+                <label>账号名 <input name="username" autocomplete="off" placeholder="留空则自动生成" /></label>
+                <label>密码 <input name="password" type="password" autocomplete="new-password" placeholder="留空则自动生成" /></label>
+                <label>临时账号时长 小时 <input name="duration_hours" type="number" min="1" step="1" value="24" /></label>
+              </div>
+              <button class="button" type="submit">创建机器账号</button>
+              <p id="directProvisionMessage" class="form-message"></p>
+            </form>
+          </section>
+
+          <section class="request-panel wide">
+            <div class="panel-head">
               <h2>账号管理</h2>
               <span>管理员创建或重置可登录本页面的账号</span>
             </div>
@@ -122,6 +149,6 @@
         </section>
       </main>
     </div>
-    <script src="/static/requests.js?v=20260610-access"></script>
+    <script src="/static/requests.js?v=20260610-provision"></script>
   </body>
 </html>

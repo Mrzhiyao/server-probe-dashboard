@@ -19,6 +19,8 @@ const els = {
   temporaryMessage: document.querySelector("#temporaryMessage"),
   accessMessage: document.querySelector("#accessMessage"),
   ownerName: document.querySelector("#ownerName"),
+  directProvisionForm: document.querySelector("#directProvisionForm"),
+  directProvisionMessage: document.querySelector("#directProvisionMessage"),
   userForm: document.querySelector("#userForm"),
   userFormMessage: document.querySelector("#userFormMessage"),
   userList: document.querySelector("#userList"),
@@ -117,6 +119,16 @@ function machineOptions() {
     .join("");
 }
 
+function machineOptionsWithSelected(selected) {
+  return state.machines
+    .map((machine) => {
+      const details = [machine.group, machine.host].filter(Boolean).join(" · ");
+      const label = details ? `${machine.name} (${details})` : machine.name;
+      return `<option value="${escapeHtml(machine.id)}"${machine.id === selected ? " selected" : ""}>${escapeHtml(label)}</option>`;
+    })
+    .join("");
+}
+
 function renderMachineSelects() {
   document.querySelectorAll("[data-machine-select]").forEach((select) => {
     const placeholder = select.querySelector("option")?.outerHTML || `<option value="">请选择机器</option>`;
@@ -157,6 +169,13 @@ function existingAccountsHtml(accounts) {
 
 function adminControls(request) {
   if (state.user?.role !== "admin") return "";
+  const recommended = request.recommendation?.candidates?.[0]?.server_id || "";
+  const selectedMachine = request.target_machine || recommended;
+  const accountType = request.request_type === "access" ? "access" : "temporary";
+  const durationInput =
+    accountType === "temporary"
+      ? `<input name="duration_hours" type="number" min="1" step="1" value="${escapeHtml(request.duration_hours || 24)}" />`
+      : `<input name="duration_hours" type="hidden" value="" />`;
   return `<form class="decision-form" data-id="${request.id}">
     <select name="status">
       ${["pending", "approved", "allocated", "rejected"]
@@ -166,6 +185,17 @@ function adminControls(request) {
     <input name="allocation_note" placeholder="分配说明，如机器/账号/到期时间" value="${escapeHtml(request.allocation_note || "")}" />
     <input name="admin_note" placeholder="管理员备注" value="${escapeHtml(request.admin_note || "")}" />
     <button class="button" type="submit">保存</button>
+  </form>
+  <form class="provision-form" data-id="${request.id}">
+    <input type="hidden" name="account_type" value="${accountType}" />
+    <select name="target_machine" required>
+      <option value="">选择机器</option>${machineOptionsWithSelected(selectedMachine)}
+    </select>
+    <input name="username" placeholder="账号名，留空自动生成" value="${escapeHtml(request.requested_account || "")}" />
+    <input name="password" type="password" placeholder="密码，留空自动生成" value="${escapeHtml(request.requested_password || "")}" />
+    ${durationInput}
+    <button class="button" type="submit">开通账号</button>
+    <p class="form-message"></p>
   </form>`;
 }
 
@@ -246,6 +276,26 @@ function renderRequests() {
         body: JSON.stringify(payload),
       });
       await loadRequests();
+    });
+  });
+  document.querySelectorAll(".provision-form").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const message = form.querySelector(".form-message");
+      showMessage(message, "");
+      try {
+        const payload = formPayload(form);
+        const result = await fetchJson(`/api/resource-requests/${form.dataset.id}/provision`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const account = result.request?.allocation_note || "账号已开通";
+        showMessage(message, escapeHtml(account).replaceAll("\n", "<br />"));
+        await loadRequests();
+      } catch (error) {
+        showMessage(message, escapeHtml(error.message || "开通失败"), true);
+      }
     });
   });
 }
@@ -368,6 +418,30 @@ els.userForm.addEventListener("submit", async (event) => {
     await loadUsers();
   } catch (error) {
     showMessage(els.userFormMessage, escapeHtml(error.message || "操作失败"), true);
+  }
+});
+
+els.directProvisionForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  showMessage(els.directProvisionMessage, "");
+  try {
+    const payload = formPayload(els.directProvisionForm);
+    const result = await fetchJson("/api/provision-account", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const account = result.account || {};
+    const lines = [
+      `机器：${account.machine || ""}`,
+      `账号：${account.username || ""}`,
+      `密码：${account.password || ""}`,
+      account.expires_at ? `到期：${account.expires_at}` : "",
+    ].filter(Boolean);
+    showMessage(els.directProvisionMessage, escapeHtml(lines.join("\n")).replaceAll("\n", "<br />"));
+    els.directProvisionForm.reset();
+  } catch (error) {
+    showMessage(els.directProvisionMessage, escapeHtml(error.message || "创建失败"), true);
   }
 });
 
