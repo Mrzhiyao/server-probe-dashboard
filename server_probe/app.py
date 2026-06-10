@@ -72,6 +72,18 @@ def public_server(server):
     return safe
 
 
+def request_machine(server):
+    return {
+        "id": server["id"],
+        "name": server.get("name") or server["id"],
+        "group": server.get("group") or "default",
+        "host": server.get("host"),
+        "port": server.get("port", 22),
+        "connection": server.get("connection", "ssh"),
+        "tags": server.get("tags", []),
+    }
+
+
 class Monitor:
     def __init__(self, config):
         self.config = config
@@ -131,6 +143,17 @@ class Monitor:
             if server["id"] == server_id:
                 return server
         return None
+
+    def request_machines(self):
+        return [request_machine(server) for server in self.servers]
+
+    def request_machine_label(self, server_id):
+        server = self.get_server(server_id)
+        if not server:
+            return server_id
+        label = server.get("name") or server["id"]
+        host = server.get("host")
+        return "%s (%s)" % (label, host) if host and host != label else label
 
     def load_alert_thresholds(self):
         defaults = {
@@ -657,7 +680,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def current_user(self):
         if not self.auth_enabled:
-            return {"username": "anonymous", "role": "admin"}
+            return {"username": "anonymous", "role": "admin", "display_name": None}
         token = self.cookie_token()
         if not token:
             return None
@@ -671,7 +694,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def require_user(self, route):
         if not self.auth_enabled or self.is_public_get(route):
-            return {"username": "anonymous", "role": "admin"}
+            return {"username": "anonymous", "role": "admin", "display_name": None}
         user = self.current_user()
         if user:
             return user
@@ -743,7 +766,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         )
         max_age = max(1, int((expires_at - utc_now()).total_seconds()))
         self.send_json(
-            {"ok": True, "user": {"username": user["username"], "role": user.get("role")}},
+            {"ok": True, "user": self.auth_user_payload(user)},
             headers={"Set-Cookie": self.cookie_header(token, max_age)},
         )
 
@@ -756,21 +779,49 @@ class DashboardHandler(BaseHTTPRequestHandler):
         )
 
     def auth_user_payload(self, user):
-        return {"username": user.get("username"), "role": user.get("role")}
+        return {
+            "username": user.get("username"),
+            "role": user.get("role"),
+            "display_name": user.get("display_name"),
+        }
 
     def validated_request_payload(self):
         data = self.read_json_body(limit=32768)
+        request_type = str(data.get("request_type") or "temporary").strip()
+        if request_type not in ("temporary", "access"):
+            raise ValueError("invalid request type")
+        owner_name = str(data.get("owner_name") or "").strip()
+        target_machine = str(data.get("target_machine") or "").strip()
+        target_machine_label = self.monitor.request_machine_label(target_machine) if target_machine else ""
+        requested_account = str(data.get("requested_account") or "").strip()
+        requested_password = str(data.get("requested_password") or "")
         model_name = str(data.get("model_name") or "").strip()
         purpose = str(data.get("purpose") or "").strip()
-        if not model_name or not purpose:
-            raise ValueError("model name and purpose are required")
         gpu_count = int(as_number(data.get("gpu_count")) or 0)
         if gpu_count < 0 or gpu_count > 16:
             raise ValueError("gpu count is out of range")
         duration_hours = int(as_number(data.get("duration_hours")) or 0)
         if duration_hours <= 0:
             duration_hours = None
+        if request_type == "temporary":
+            if not model_name or not purpose:
+                raise ValueError("model name and purpose are required")
+            if duration_hours is None:
+                raise ValueError("duration is required for temporary requests")
+        else:
+            if not owner_name:
+                raise ValueError("owner name is required")
+            if not target_machine:
+                raise ValueError("target machine is required")
+            if not requested_account or not requested_password:
+                raise ValueError("account name and password are required")
+            if not model_name:
+                model_name = "Long-term access for %s" % requested_account
+            if not purpose:
+                purpose = "Long-term machine access request"
         return {
+            "request_type": request_type,
+            "owner_name": owner_name[:80],
             "model_name": model_name[:160],
             "model_size": str(data.get("model_size") or "").strip()[:80],
             "purpose": purpose[:2000],
@@ -778,6 +829,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "gpu_count": gpu_count,
             "gpu_memory_gb": rounded(data.get("gpu_memory_gb")),
             "duration_hours": duration_hours,
+            "target_machine": target_machine[:160],
+            "target_machine_label": target_machine_label[:240],
+            "requested_account": requested_account[:120],
+            "requested_password": requested_password[:300],
             "notes": str(data.get("notes") or "").strip()[:3000],
         }
 
@@ -787,7 +842,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
             return
-        recommendation = self.monitor.resource_recommendation(payload)
+        recommendation = {}
+        if payload["request_type"] == "temporary":
+            recommendation = self.monitor.resource_recommendation(payload)
+        else:
+            existing = self.auth_store.find_existing_accounts(
+                payload.get("owner_name") or user.get("display_name") or user.get("username"),
+                payload.get("target_machine") or payload.get("target_machine_label"),
+                payload.get("requested_account"),
+            )
+            if existing:
+                self.send_json(
+                    {
+                        "error": "account already exists",
+                        "existing_accounts": existing,
+                    },
+                    status=409,
+                )
+                return
+            recommendation = {
+                "generated_at": utc_now_iso(),
+                "message": "Long-term access request requires admin approval",
+                "candidates": [],
+            }
         request_id = self.auth_store.create_model_request(user["id"], payload, recommendation)
         self.send_json({"ok": True, "id": request_id, "recommendation": recommendation}, status=201)
 
@@ -823,14 +900,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         username = str(data.get("username") or "").strip()
         password = str(data.get("password") or "")
         role = str(data.get("role") or "user").strip()
+        display_name = str(data.get("display_name") or "").strip()
         if not username or not password:
             self.send_json({"error": "username and password are required"}, status=400)
             return
         if role not in ("admin", "user"):
             self.send_json({"error": "invalid role"}, status=400)
             return
-        self.auth_store.set_password(username, password, role=role)
-        self.send_json({"ok": True, "user": {"username": username, "role": role}}, status=201)
+        self.auth_store.set_password(username, password, role=role, display_name=display_name or None)
+        self.send_json({"ok": True, "user": {"username": username, "role": role, "display_name": display_name}}, status=201)
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -877,6 +955,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "authentication is disabled"}, status=404)
                 return
             self.send_json({"requests": self.auth_store.list_model_requests(user)})
+            return
+
+        if route == "/api/request-machines":
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.send_json({"machines": self.monitor.request_machines()})
             return
 
         if route == "/api/users":

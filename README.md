@@ -12,7 +12,7 @@ A lightweight SSH-based Linux resource dashboard. The dashboard host periodicall
 - Jetson GPU metrics through `tegrastats`
 - Direct SSH and SSH jump-host collection
 - Optional PostgreSQL-backed login and session access control
-- User-submitted model/resource requests with admin approval workflow
+- User-submitted temporary account and long-term access requests with admin approval workflow
 - Secrets read from environment variables, not frontend code or API responses
 
 ## Run
@@ -52,12 +52,20 @@ Initialize the auth tables and create an admin user:
 ```bash
 python -m server_probe.auth init-db
 python -m server_probe.auth set-password admin --role admin
-python -m server_probe.auth set-password alice --role user
+python -m server_probe.auth set-password alice --role user --display-name "Alice"
 ```
 
 Use HTTPS in front of the dashboard when exposing it beyond a trusted LAN.
 
-Logged-in users can submit model/resource requests from `/requests`. Admins can review all requests, see machine recommendations based on the current dashboard snapshot, create users, and mark requests as approved, rejected, or allocated.
+Logged-in users can submit requests from `/requests`. Normal users see a submit page and their own request list. Admins see an approval page and an account-management page. Temporary account requests use the current dashboard snapshot to recommend machines. Long-term access requests can be checked against an imported machine-account index before duplicate requests are created.
+
+Existing user and machine-account inventories can be imported from JSON without committing private data:
+
+```bash
+python -m server_probe.auth import-users-json --source private-inventory < users.json
+```
+
+The JSON input can be either a list or an object with a `users` list. Each item can contain `username`, `password`, `display_name`, `machine_key`, `machine_label`, and optional `metadata`.
 
 ## systemd
 

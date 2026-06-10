@@ -397,6 +397,48 @@ summary:focus-visible {
   justify-content: flex-start;
 }
 
+.page-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 14px 0 0;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(17, 19, 21, 0.72);
+}
+
+.tab-button,
+.mode-button {
+  min-height: 38px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  padding: 0 14px;
+  font: inherit;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.tab-button.active,
+.mode-button.active {
+  border-color: rgba(117, 211, 159, 0.45);
+  background: rgba(117, 211, 159, 0.13);
+  color: var(--text);
+}
+
+.page-view {
+  margin-top: 16px;
+}
+
+.mode-switch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
 .request-layout {
   display: grid;
   grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
@@ -480,6 +522,10 @@ textarea:focus {
   font-size: 12px;
 }
 
+.form-message.error {
+  color: var(--red);
+}
+
 .mini-list {
   display: grid;
   gap: 8px;
@@ -551,6 +597,27 @@ textarea:focus {
 .request-card h4 {
   margin: 0;
   font-size: 13px;
+}
+
+.secret-box {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.secret-box summary {
+  cursor: pointer;
+  font-weight: 900;
+}
+
+.secret-box code {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.22);
+  color: var(--text);
+  overflow-wrap: anywhere;
 }
 
 .request-meta {
