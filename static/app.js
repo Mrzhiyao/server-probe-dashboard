@@ -6,11 +6,17 @@ const state = {
   historyRetentionPoints: 240,
   alertThresholds: {},
   timer: null,
+  clockTimer: null,
+  nextRefreshAt: null,
   loading: false,
 };
 
 const els = {
   pageTitle: document.querySelector("#pageTitle"),
+  beijingTime: document.querySelector("#beijingTime"),
+  aoeTime: document.querySelector("#aoeTime"),
+  weatherMeta: document.querySelector("#weatherMeta"),
+  weatherText: document.querySelector("#weatherText"),
   onlineCount: document.querySelector("#onlineCount"),
   warnCount: document.querySelector("#warnCount"),
   offlineCount: document.querySelector("#offlineCount"),
@@ -27,6 +33,11 @@ const els = {
   serverGrid: document.querySelector("#serverGrid"),
   template: document.querySelector("#serverCardTemplate"),
 };
+
+const WEATHER_CACHE_KEY = "serverProbe.weather.beijing.v1";
+const WEATHER_CACHE_MS = 15 * 60 * 1000;
+const WEATHER_URL =
+  "https://api.open-meteo.com/v1/forecast?latitude=39.9042&longitude=116.4074&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&timezone=Asia%2FShanghai&forecast_days=1";
 
 function fmtPercent(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "N/A";
@@ -57,9 +68,110 @@ function fmtTime(iso) {
   return date.toLocaleString("zh-CN", { hour12: false });
 }
 
+function fmtClock(date, timeZone) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone,
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function fmtClockTime(date) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
 function finiteNumber(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return null;
   return Number(value);
+}
+
+function weatherCodeText(code) {
+  const value = Number(code);
+  if (value === 0) return "晴";
+  if ([1, 2].includes(value)) return "少云";
+  if (value === 3) return "阴";
+  if ([45, 48].includes(value)) return "雾";
+  if ([51, 53, 55, 56, 57].includes(value)) return "毛毛雨";
+  if ([61, 63, 65, 66, 67].includes(value)) return "雨";
+  if ([71, 73, 75, 77].includes(value)) return "雪";
+  if ([80, 81, 82].includes(value)) return "阵雨";
+  if ([85, 86].includes(value)) return "阵雪";
+  if ([95, 96, 99].includes(value)) return "雷雨";
+  return "天气";
+}
+
+function weatherSummary(payload) {
+  const current = payload?.current || {};
+  const temp = finiteNumber(current.temperature_2m);
+  const apparent = finiteNumber(current.apparent_temperature);
+  const humidity = finiteNumber(current.relative_humidity_2m);
+  const wind = finiteNumber(current.wind_speed_10m);
+  const parts = [
+    `${weatherCodeText(current.weather_code)} ${temp === null ? "N/A" : `${temp.toFixed(0)}°C`}`,
+    apparent === null ? "" : `体感 ${apparent.toFixed(0)}°C`,
+    humidity === null ? "" : `湿度 ${humidity.toFixed(0)}%`,
+    wind === null ? "" : `风 ${wind.toFixed(0)}km/h`,
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
+function readCachedWeather() {
+  try {
+    const cached = JSON.parse(localStorage.getItem(WEATHER_CACHE_KEY) || "null");
+    if (cached && Date.now() - cached.savedAt < WEATHER_CACHE_MS) return cached.payload;
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function writeCachedWeather(payload) {
+  try {
+    localStorage.setItem(WEATHER_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), payload }));
+  } catch {
+    // Storage can be unavailable in private browsing modes.
+  }
+}
+
+function renderWeather(payload, stale = false) {
+  if (!els.weatherText) return;
+  els.weatherText.textContent = weatherSummary(payload) || "天气暂不可用";
+  if (els.weatherMeta) {
+    const time = payload?.current?.time ? fmtClockTime(new Date(payload.current.time)) : "";
+    els.weatherMeta.textContent = ["北京天气", stale ? "缓存" : "", time].filter(Boolean).join(" · ");
+  }
+}
+
+async function loadWeather() {
+  const cached = readCachedWeather();
+  if (cached) renderWeather(cached, true);
+  try {
+    const response = await fetch(WEATHER_URL, { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    writeCachedWeather(payload);
+    renderWeather(payload, false);
+  } catch {
+    if (!cached && els.weatherText) {
+      els.weatherText.textContent = "天气暂不可用";
+      if (els.weatherMeta) els.weatherMeta.textContent = "北京天气";
+    }
+  }
+}
+
+function renderClocks() {
+  const now = new Date();
+  if (els.beijingTime) els.beijingTime.textContent = fmtClock(now, "Asia/Shanghai");
+  if (els.aoeTime) els.aoeTime.textContent = fmtClock(now, "Etc/GMT+12");
 }
 
 function gpuDevices(metrics) {
@@ -671,7 +783,7 @@ async function loadMeta() {
   const title = meta.title || "Server Probe Dashboard";
   document.title = title;
   els.pageTitle.textContent = title;
-  els.refreshState.textContent = `${state.refreshSeconds}s 刷新`;
+  renderRefreshState();
   els.groupFilter.innerHTML = `<option value="all">全部</option>${state.groups
     .map((group) => `<option value="${escapeHtml(group)}">${escapeHtml(group)}</option>`)
     .join("")}`;
@@ -706,11 +818,41 @@ async function loadSnapshot(force = false) {
 function schedule() {
   clearInterval(state.timer);
   if (!els.autoRefresh.checked) {
-    els.refreshState.textContent = "自动已停";
+    state.nextRefreshAt = null;
+    renderRefreshState();
     return;
   }
-  els.refreshState.textContent = `${state.refreshSeconds}s 刷新`;
-  state.timer = setInterval(() => loadSnapshot(false), state.refreshSeconds * 1000);
+  state.nextRefreshAt = Date.now() + state.refreshSeconds * 1000;
+  renderRefreshState();
+  state.timer = setInterval(() => {
+    state.nextRefreshAt = Date.now() + state.refreshSeconds * 1000;
+    renderRefreshState();
+    loadSnapshot(false);
+  }, state.refreshSeconds * 1000);
+}
+
+function renderRefreshState() {
+  if (!els.refreshState) return;
+  if (!els.autoRefresh.checked) {
+    els.refreshState.textContent = `自动已停 · 间隔 ${state.refreshSeconds}s`;
+    return;
+  }
+  if (!state.nextRefreshAt) {
+    els.refreshState.textContent = `间隔 ${state.refreshSeconds}s`;
+    return;
+  }
+  const secondsLeft = Math.max(0, Math.ceil((state.nextRefreshAt - Date.now()) / 1000));
+  els.refreshState.textContent = `间隔 ${state.refreshSeconds}s · 下次 ${fmtClockTime(new Date(state.nextRefreshAt))} · 还有 ${secondsLeft}s`;
+}
+
+function startUiTicker() {
+  renderClocks();
+  renderRefreshState();
+  clearInterval(state.clockTimer);
+  state.clockTimer = setInterval(() => {
+    renderClocks();
+    renderRefreshState();
+  }, 1000);
 }
 
 els.refreshButton.addEventListener("click", () => loadSnapshot(true));
@@ -724,6 +866,9 @@ els.searchInput.addEventListener("input", render);
 els.sortSelect.addEventListener("change", render);
 
 (async function start() {
+  startUiTicker();
+  loadWeather();
+  setInterval(loadWeather, WEATHER_CACHE_MS);
   await loadAuthState();
   await loadMeta();
   await loadSnapshot(false);

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Server Probe Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260611-permissions" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260611-clock-weather" />
   </head>
   <body>
     <div class="app-shell">
@@ -14,6 +14,9 @@
           <h1 id="pageTitle">Server Probe Dashboard</h1>
         </div>
         <div class="status-strip" aria-live="polite">
+          <div class="info-chip"><small>北京时间</small><span id="beijingTime">--:--:--</span></div>
+          <div class="info-chip"><small>AoE 时间</small><span id="aoeTime">--:--:--</span></div>
+          <div class="info-chip weather-chip"><small id="weatherMeta">北京天气</small><span id="weatherText">加载中</span></div>
           <div class="stat-chip"><span id="onlineCount">0</span><small>在线</small></div>
           <div class="stat-chip warn"><span id="warnCount">0</span><small>高负载</small></div>
           <div class="stat-chip danger"><span id="offlineCount">0</span><small>离线</small></div>
@@ -102,6 +105,6 @@
       </article>
     </template>
 
-    <script src="/static/app.js?v=20260611-admin-link"></script>
+    <script src="/static/app.js?v=20260611-clock-weather"></script>
   </body>
 </html>
