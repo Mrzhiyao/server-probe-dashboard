@@ -342,10 +342,45 @@ function renderUsers(users) {
         .map((user) => {
           const display = user.display_name ? ` · ${escapeHtml(user.display_name)}` : "";
           const status = user.is_active ? "启用" : "停用";
-          return `<div><strong>${escapeHtml(user.username)}</strong><span>${roleText(user.role)}${display} · ${status}</span></div>`;
+          const canView = user.can_view_dashboard || user.role === "admin";
+          const adminLocked = user.role === "admin";
+          return `<form class="user-row permission-form" data-username="${escapeHtml(user.username)}">
+            <div>
+              <strong>${escapeHtml(user.username)}</strong>
+              <span>${roleText(user.role)}${display} · ${status}</span>
+            </div>
+            <label class="checkbox-line permission-control">
+              <input name="can_view_dashboard" type="checkbox"${canView ? " checked" : ""}${adminLocked ? " disabled" : ""} />
+              监控面板
+            </label>
+            <button class="button ghost mini-action" type="submit"${adminLocked ? " disabled" : ""}>保存</button>
+          </form>`;
         })
         .join("")
     : `<div class="empty">暂无用户</div>`;
+  document.querySelectorAll(".permission-form").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = form.querySelector("button");
+      const checkbox = form.elements.can_view_dashboard;
+      button.disabled = true;
+      button.textContent = "保存中";
+      try {
+        await fetchJson(`/api/users/${encodeURIComponent(form.dataset.username)}/permissions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ can_view_dashboard: checkbox.checked }),
+        });
+        showToast("用户权限已保存");
+        await loadUsers();
+      } catch (error) {
+        showToast(error.message || "权限保存失败", true);
+      } finally {
+        button.disabled = false;
+        button.textContent = "保存";
+      }
+    });
+  });
 }
 
 function renderPasswordUsers() {
@@ -433,6 +468,9 @@ function passwordResultMessage(result) {
   } else {
     lines.push("未找到同名机器账号，已只更新网页登录密码");
   }
+  if (result.reauth_required) {
+    lines.push("用户信息已更新，请重新登录");
+  }
   return escapeHtml(lines.join("\n")).replaceAll("\n", "<br />");
 }
 
@@ -496,7 +534,7 @@ async function start() {
     syncPasswordFormRole();
     setPage("review");
   } else {
-    els.dashboardLink.hidden = true;
+    els.dashboardLink.hidden = !state.user.can_view_dashboard;
     syncPasswordFormRole();
     setPage("submit");
   }
@@ -600,6 +638,13 @@ els.passwordForm.addEventListener("submit", async (event) => {
     form.reset();
     syncPasswordFormRole();
     showMessage(els.passwordMessage, passwordResultMessage(result));
+    if (result.reauth_required) {
+      showToast("用户信息已更新，请重新登录");
+      window.setTimeout(() => {
+        window.location.href = "/login";
+      }, 1400);
+      return;
+    }
     showToast("密码已更新");
     await loadUsers();
   } catch (error) {

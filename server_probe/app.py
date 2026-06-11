@@ -66,6 +66,16 @@ def env_bool(name, default=False):
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def value_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def public_server(server):
     safe = {
         "id": server["id"],
@@ -1105,6 +1115,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def is_admin(self, user):
         return bool(user and user.get("role") == "admin")
 
+    def can_view_dashboard(self, user):
+        return bool(user and (user.get("role") == "admin" or user.get("can_view_dashboard")))
+
     def is_public_get(self, route):
         return route in ("/login", "/api/health", "/favicon.ico") or route.startswith("/static/")
 
@@ -1125,6 +1138,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.is_admin(user):
             return True
         self.send_json({"error": "admin permission required"}, status=403)
+        return False
+
+    def require_dashboard_viewer(self, user):
+        if self.can_view_dashboard(user):
+            return True
+        self.send_json({"error": "dashboard permission required"}, status=403)
         return False
 
     def client_ip(self):
@@ -1199,6 +1218,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "username": user.get("username"),
             "role": user.get("role"),
             "display_name": user.get("display_name"),
+            "can_view_dashboard": self.can_view_dashboard(user),
         }
 
     def validated_request_payload(self):
@@ -1317,6 +1337,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         password = str(data.get("password") or "")
         role = str(data.get("role") or "user").strip()
         display_name = str(data.get("display_name") or "").strip()
+        can_view_dashboard = value_bool(data.get("can_view_dashboard"), False)
         if not username or not password:
             self.send_json({"error": "username and password are required"}, status=400)
             return
@@ -1324,11 +1345,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "invalid role"}, status=400)
             return
         self.auth_store.set_password(username, password, role=role, display_name=display_name or None)
+        updated_user = self.auth_store.update_user_permissions(username, can_view_dashboard)
         machine_sync = self.sync_machine_passwords(username, password)
         self.send_json(
             {
                 "ok": True,
-                "user": {"username": username, "role": role, "display_name": display_name},
+                "user": self.auth_user_payload(updated_user or {"username": username, "role": role, "display_name": display_name}),
                 "machine_sync": machine_sync,
                 "machine_sync_summary": {
                     "total": len(machine_sync),
@@ -1339,6 +1361,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             },
             status=201,
         )
+
+    def update_user_permissions(self, route, user):
+        if not self.require_admin(user):
+            return
+        username = urllib.parse.unquote(route.split("/")[-2])
+        data = self.read_json_body()
+        updated = self.auth_store.update_user_permissions(
+            username,
+            value_bool(data.get("can_view_dashboard"), False),
+        )
+        if not updated:
+            self.send_json({"error": "user not found"}, status=404)
+            return
+        self.send_json({"ok": True, "user": self.auth_user_payload(updated)})
 
     def sync_dashboard_user_for_machine_account(self, payload):
         display_name = payload.get("owner_name") or ""
@@ -1384,8 +1420,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         current_password = str(data.get("current_password") or "")
         new_password = str(data.get("new_password") or data.get("password") or "")
         sync_machine = data.get("sync_machine_password", True)
-        if isinstance(sync_machine, str):
-            sync_machine = sync_machine.lower() not in ("0", "false", "no", "off", "")
+        sync_machine = value_bool(sync_machine, True)
 
         if not target_username:
             self.send_json({"error": "target username is required"}, status=400)
@@ -1412,6 +1447,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         machine_sync = self.sync_machine_passwords(updated["username"], new_password) if sync_machine else []
         failed = [item for item in machine_sync if item.get("status") == "error"]
         skipped = [item for item in machine_sync if item.get("status") == "skipped"]
+        reauth_required = updated["username"].lower() == str(user.get("username") or "").lower()
+        headers = None
+        if reauth_required:
+            self.auth_store.destroy_session(self.cookie_token())
+            headers = {"Set-Cookie": self.cookie_header("", 0)}
         self.send_json(
             {
                 "ok": True,
@@ -1419,6 +1459,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "username": updated["username"],
                     "role": updated["role"],
                     "display_name": updated["display_name"],
+                    "can_view_dashboard": self.can_view_dashboard(updated),
                 },
                 "machine_sync": machine_sync,
                 "machine_sync_summary": {
@@ -1427,7 +1468,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "failed": len(failed),
                     "skipped": len(skipped),
                 },
-            }
+                "reauth_required": reauth_required,
+            },
+            headers=headers,
         )
 
     def provision_payload(self, data, request=None):
@@ -1655,7 +1698,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/servers":
-            if not self.require_admin(user):
+            if not self.require_dashboard_viewer(user):
                 return
             config = self.monitor.config
             groups = sorted({server.get("group", "default") for server in self.monitor.servers})
@@ -1672,14 +1715,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/snapshot":
-            if not self.require_admin(user):
+            if not self.require_dashboard_viewer(user):
                 return
             force = query.get("force", ["0"])[0] == "1"
             self.send_json(self.monitor.cached_snapshot(trigger=force))
             return
 
         if route == "/api/history":
-            if not self.require_admin(user):
+            if not self.require_dashboard_viewer(user):
                 return
             self.send_json(
                 {
@@ -1692,7 +1735,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if route.startswith("/api/server/"):
-            if not self.require_admin(user):
+            if not self.require_dashboard_viewer(user):
                 return
             server_id = urllib.parse.unquote(route.rsplit("/", 1)[-1])
             server = self.monitor.get_server(server_id)
@@ -1704,7 +1747,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if route in ("", "/"):
-            if not self.is_admin(user):
+            if not self.can_view_dashboard(user):
                 self.send_redirect("/requests")
                 return
             self.send_file(STATIC_DIR / "index.html")
@@ -1769,6 +1812,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "authentication is disabled"}, status=404)
                 return
             self.change_password(user)
+            return
+
+        if route.startswith("/api/users/") and route.endswith("/permissions"):
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.update_user_permissions(route, user)
             return
 
         if route == "/api/users":

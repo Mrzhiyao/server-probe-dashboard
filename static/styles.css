@@ -561,8 +561,12 @@ textarea:focus {
 }
 
 .compact-form {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   align-items: end;
+}
+
+.compact-form .form-message {
+  grid-column: 1 / -1;
 }
 
 .form-message {
@@ -582,9 +586,10 @@ textarea:focus {
   margin-top: 12px;
 }
 
-.mini-list div {
-  display: flex;
-  justify-content: space-between;
+.mini-list .user-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  align-items: center;
   gap: 10px;
   padding-top: 8px;
   border-top: 1px solid rgba(255, 255, 255, 0.07);
@@ -592,8 +597,26 @@ textarea:focus {
   font-size: 12px;
 }
 
+.mini-list .user-row > div {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 10px;
+  min-width: 0;
+}
+
 .mini-list strong {
   color: var(--text);
+}
+
+.permission-control {
+  justify-content: flex-end;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.mini-action {
+  min-width: 64px;
 }
 
 .request-list {
@@ -1285,6 +1308,15 @@ td.command {
   .decision-form,
   .provision-form {
     grid-template-columns: 1fr;
+  }
+
+  .mini-list .user-row {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .permission-control {
+    justify-content: flex-start;
   }
 }
 

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Request Center - Server Probe Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260611-account-sync" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260611-permissions" />
   </head>
   <body>
     <div class="app-shell">
@@ -165,6 +165,7 @@
                   <option value="admin">管理员</option>
                 </select>
               </label>
+              <label class="checkbox-line"><input name="can_view_dashboard" type="checkbox" /> 允许看监控</label>
               <button class="button" type="submit">创建/重置</button>
               <p id="userFormMessage" class="form-message"></p>
             </form>
@@ -173,6 +174,6 @@
         </section>
       </main>
     </div>
-    <script src="/static/requests.js?v=20260611-account-sync"></script>
+    <script src="/static/requests.js?v=20260611-permissions"></script>
   </body>
 </html>

@@ -192,28 +192,32 @@ class AuthStore:
                         (username, hashed, display_name),
                     )
 
+    def user_dict(self, row):
+        profile = row[7] or {}
+        can_view_dashboard = bool(row[2] == "admin" or profile.get("can_view_dashboard"))
+        return {
+            "id": row[0],
+            "username": row[1],
+            "role": row[2],
+            "display_name": row[3],
+            "is_active": row[4],
+            "created_at": row[5].isoformat() if row[5] else None,
+            "last_login_at": row[6].isoformat() if row[6] else None,
+            "profile": profile,
+            "can_view_dashboard": can_view_dashboard,
+        }
+
     def list_users(self):
         with self.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, username, role, display_name, is_active, created_at, last_login_at
+                    SELECT id, username, role, display_name, is_active, created_at, last_login_at, profile
                     FROM probe_users
                     ORDER BY role, username
                     """
                 )
-                return [
-                    {
-                        "id": row[0],
-                        "username": row[1],
-                        "role": row[2],
-                        "display_name": row[3],
-                        "is_active": row[4],
-                        "created_at": row[5].isoformat() if row[5] else None,
-                        "last_login_at": row[6].isoformat() if row[6] else None,
-                    }
-                    for row in cur.fetchall()
-                ]
+                return [self.user_dict(row) for row in cur.fetchall()]
 
     def get_user_by_username(self, username):
         username = str(username or "").strip()
@@ -223,24 +227,35 @@ class AuthStore:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, username, role, display_name, is_active, created_at, last_login_at
+                    SELECT id, username, role, display_name, is_active, created_at, last_login_at, profile
                     FROM probe_users
                     WHERE lower(username) = lower(%s)
                     """,
                     (username,),
                 )
                 row = cur.fetchone()
-                if not row:
-                    return None
-                return {
-                    "id": row[0],
-                    "username": row[1],
-                    "role": row[2],
-                    "display_name": row[3],
-                    "is_active": row[4],
-                    "created_at": row[5].isoformat() if row[5] else None,
-                    "last_login_at": row[6].isoformat() if row[6] else None,
-                }
+                return self.user_dict(row) if row else None
+
+    def update_user_permissions(self, username, can_view_dashboard=False):
+        username = str(username or "").strip()
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE probe_users
+                    SET profile = jsonb_set(
+                      COALESCE(profile, '{}'::jsonb),
+                      '{can_view_dashboard}',
+                      to_jsonb(%s::boolean),
+                      true
+                    )
+                    WHERE lower(username) = lower(%s)
+                    RETURNING id, username, role, display_name, is_active, created_at, last_login_at, profile
+                    """,
+                    (bool(can_view_dashboard), username),
+                )
+                row = cur.fetchone()
+                return self.user_dict(row) if row else None
 
     def update_existing_password(self, username, password):
         username = str(username or "").strip()
@@ -254,27 +269,19 @@ class AuthStore:
                     UPDATE probe_users
                     SET password_hash = %s
                     WHERE lower(username) = lower(%s)
-                    RETURNING id, username, role, display_name, is_active
+                    RETURNING id, username, role, display_name, is_active, created_at, last_login_at, profile
                     """,
                     (hashed, username),
                 )
                 row = cur.fetchone()
-                if not row:
-                    return None
-                return {
-                    "id": row[0],
-                    "username": row[1],
-                    "role": row[2],
-                    "display_name": row[3],
-                    "is_active": row[4],
-                }
+                return self.user_dict(row) if row else None
 
     def verify_user(self, username, password):
         with self.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, username, password_hash, role, display_name
+                    SELECT id, username, password_hash, role, display_name, is_active, created_at, last_login_at, profile
                     FROM probe_users
                     WHERE username = %s AND is_active = TRUE
                     """,
@@ -286,7 +293,7 @@ class AuthStore:
                 if not verify_password(password, row[2]):
                     return None
                 cur.execute("UPDATE probe_users SET last_login_at = now() WHERE id = %s", (row[0],))
-                return {"id": row[0], "username": row[1], "role": row[3], "display_name": row[4]}
+                return self.user_dict((row[0], row[1], row[3], row[4], row[5], row[6], row[7], row[8]))
 
     def create_session(self, user_id, ip_address="", user_agent=""):
         token = secrets.token_urlsafe(32)
@@ -310,7 +317,7 @@ class AuthStore:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT u.id, u.username, u.role, u.display_name
+                    SELECT u.id, u.username, u.role, u.display_name, u.is_active, u.created_at, u.last_login_at, u.profile
                     FROM probe_sessions s
                     JOIN probe_users u ON u.id = s.user_id
                     WHERE s.token_hash = %s
@@ -326,7 +333,7 @@ class AuthStore:
                     "UPDATE probe_sessions SET last_seen_at = now() WHERE token_hash = %s",
                     (token_hash(token),),
                 )
-                return {"id": row[0], "username": row[1], "role": row[2], "display_name": row[3]}
+                return self.user_dict(row)
 
     def destroy_session(self, token):
         if not token:
