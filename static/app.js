@@ -652,6 +652,9 @@ async function fetchJson(url) {
 
 async function loadAuthState() {
   const auth = await fetchJson("/api/auth/me");
+  if (els.requestLink && auth.user) {
+    els.requestLink.textContent = auth.user.role === "admin" ? "用户管理" : "申请";
+  }
   if (!auth.auth_enabled) {
     if (els.requestLink) els.requestLink.hidden = true;
     if (els.logoutButton) els.logoutButton.hidden = true;
