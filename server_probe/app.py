@@ -234,6 +234,58 @@ except Exception:
 '''
 
 
+REMOTE_PASSWORD_CHANGER = r'''
+import json
+import os
+import pwd
+import re
+import subprocess
+
+
+ACCOUNT_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+
+def run(command, input_text=None, check=True):
+    completed = subprocess.run(
+        command,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if check and completed.returncode != 0:
+        raise RuntimeError((completed.stderr or completed.stdout or "command failed").strip())
+    return completed
+
+
+def user_exists(username):
+    try:
+        pwd.getpwnam(username)
+        return True
+    except KeyError:
+        return False
+
+
+payload = json.loads(__PAYLOAD_JSON__)
+username = str(payload.get("username") or "").strip()
+password = str(payload.get("password") or "")
+
+if os.geteuid() != 0:
+    raise SystemExit("root permission is required")
+if not ACCOUNT_NAME_RE.match(username):
+    raise SystemExit("invalid account name")
+if "\n" in password or "\r" in password or not password:
+    raise SystemExit("invalid password")
+if not user_exists(username):
+    raise SystemExit("machine account not found")
+
+run(["chpasswd"], "%s:%s\n" % (username, password))
+run(["chage", "-M", "99999", username], check=False)
+print(json.dumps({"ok": True, "username": username, "password_changed": True}))
+'''
+
+
 def generated_password(length=18):
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
@@ -781,16 +833,23 @@ class Monitor:
 
     def run_local_provisioner(self, payload):
         script = REMOTE_PROVISIONER.replace("__PAYLOAD_JSON__", json.dumps(json.dumps(payload)))
+        return self.run_local_root_script(script, timeout=60, error_message="account provisioning failed")
+
+    def run_local_password_changer(self, payload):
+        script = REMOTE_PASSWORD_CHANGER.replace("__PAYLOAD_JSON__", json.dumps(json.dumps(payload)))
+        return self.run_local_root_script(script, timeout=60, error_message="machine password change failed")
+
+    def run_local_root_script(self, script, timeout=60, error_message="remote command failed"):
         completed = subprocess.run(
             [sys.executable, "-"],
             input=script + "\n",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
-            timeout=60,
+            timeout=timeout,
         )
         if completed.returncode != 0:
-            raise RuntimeError(self.redact((completed.stderr or completed.stdout or "account provisioning failed").strip()))
+            raise RuntimeError(self.redact((completed.stderr or completed.stdout or error_message).strip()))
         return json.loads(completed.stdout.strip().splitlines()[-1])
 
     def run_remote_provisioner(self, server, payload):
@@ -833,7 +892,55 @@ class Monitor:
             if jump_client is not None:
                 jump_client.close()
 
+    def run_remote_password_changer(self, server, payload):
+        target = self.provision_target(server)
+        if target.get("connection") == "local":
+            return self.run_local_password_changer(payload)
+
+        jump_client = None
+        client = None
+        try:
+            sock = None
+            if target.get("jump"):
+                jump = target["jump"]
+                jump_client = self.open_client(
+                    host=jump["host"],
+                    port=int(jump.get("port", 22)),
+                    user=jump["user"],
+                    password=self.resolve_password(jump),
+                    timeout=self.server_timeout(jump, "connect_timeout_seconds", self.connect_timeout),
+                )
+                transport = jump_client.get_transport()
+                sock = transport.open_channel(
+                    "direct-tcpip",
+                    (target["host"], int(target.get("port", 22))),
+                    ("127.0.0.1", 0),
+                )
+
+            client = self.open_client(
+                host=target["host"],
+                port=int(target.get("port", 22)),
+                user=target["user"],
+                password=self.resolve_password(target),
+                sock=sock,
+                timeout=self.server_timeout(target, "connect_timeout_seconds", self.connect_timeout),
+            )
+            return self.execute_password_changer(client, self.resolve_password(target), payload, timeout=60)
+        finally:
+            if client is not None:
+                client.close()
+            if jump_client is not None:
+                jump_client.close()
+
     def execute_provisioner(self, client, ssh_password, payload, timeout=60):
+        script = REMOTE_PROVISIONER.replace("__PAYLOAD_JSON__", json.dumps(json.dumps(payload)))
+        return self.execute_root_python(client, ssh_password, script, timeout=timeout, error_message="account provisioning failed")
+
+    def execute_password_changer(self, client, ssh_password, payload, timeout=60):
+        script = REMOTE_PASSWORD_CHANGER.replace("__PAYLOAD_JSON__", json.dumps(json.dumps(payload)))
+        return self.execute_root_python(client, ssh_password, script, timeout=timeout, error_message="machine password change failed")
+
+    def execute_root_python(self, client, ssh_password, script, timeout=60, error_message="remote command failed"):
         check_stdin, check_stdout, check_stderr = client.exec_command("id -u", timeout=10)
         uid_out = check_stdout.read().decode("utf-8", "replace").strip()
         check_stderr.read()
@@ -856,7 +963,6 @@ class Monitor:
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
         if needs_sudo_password and ssh_password:
             stdin.write(str(ssh_password) + "\n")
-        script = REMOTE_PROVISIONER.replace("__PAYLOAD_JSON__", json.dumps(json.dumps(payload)))
         stdin.write(script)
         stdin.write("\n")
         stdin.channel.shutdown_write()
@@ -864,7 +970,7 @@ class Monitor:
         err = stderr.read().decode("utf-8", "replace")
         code = stdout.channel.recv_exit_status()
         if code != 0:
-            raise RuntimeError(self.redact(err.strip() or out.strip() or "account provisioning failed"))
+            raise RuntimeError(self.redact(err.strip() or out.strip() or error_message))
         return json.loads(out.strip().splitlines()[-1])
 
     def provision_account(self, server_id, username, password, temporary=False, expires_at=None):
@@ -878,6 +984,16 @@ class Monitor:
             "expires_at": expires_at,
         }
         result = self.run_remote_provisioner(server, payload)
+        result["server_id"] = server_id
+        result["server_name"] = server.get("name") or server_id
+        return result
+
+    def change_machine_password(self, server_id, username, password):
+        server = self.get_server(server_id)
+        if not server:
+            raise ValueError("target machine not found")
+        payload = {"username": username, "password": password}
+        result = self.run_remote_password_changer(server, payload)
         result["server_id"] = server_id
         result["server_name"] = server.get("name") or server_id
         return result
@@ -1210,6 +1326,91 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.auth_store.set_password(username, password, role=role, display_name=display_name or None)
         self.send_json({"ok": True, "user": {"username": username, "role": role, "display_name": display_name}}, status=201)
 
+    def sync_machine_passwords(self, username, password):
+        accounts = self.auth_store.machine_accounts_for_username(username)
+        results = []
+        seen = set()
+        for account in accounts:
+            server_id = str(account.get("machine_key") or "").strip()
+            if not server_id or server_id in seen:
+                continue
+            seen.add(server_id)
+            result = {
+                "machine_key": server_id,
+                "machine_label": account.get("machine_label") or server_id,
+                "username": account.get("username") or username,
+                "status": "pending",
+            }
+            try:
+                if not self.monitor.get_server(server_id):
+                    result.update({"status": "skipped", "message": "machine is not configured"})
+                else:
+                    changed = self.monitor.change_machine_password(server_id, result["username"], password)
+                    result.update(
+                        {
+                            "status": "ok",
+                            "message": "password synced",
+                            "server_name": changed.get("server_name"),
+                        }
+                    )
+            except Exception as exc:
+                result.update({"status": "error", "message": self.monitor.redact(str(exc)) or "sync failed"})
+            results.append(result)
+        return results
+
+    def change_password(self, user):
+        data = self.read_json_body(limit=32768)
+        requested_username = str(data.get("username") or "").strip()
+        target_username = requested_username if self.is_admin(user) and requested_username else user.get("username")
+        current_password = str(data.get("current_password") or "")
+        new_password = str(data.get("new_password") or data.get("password") or "")
+        sync_machine = data.get("sync_machine_password", True)
+        if isinstance(sync_machine, str):
+            sync_machine = sync_machine.lower() not in ("0", "false", "no", "off", "")
+
+        if not target_username:
+            self.send_json({"error": "target username is required"}, status=400)
+            return
+        if not new_password:
+            self.send_json({"error": "new password is required"}, status=400)
+            return
+        if "\n" in new_password or "\r" in new_password:
+            self.send_json({"error": "invalid password"}, status=400)
+            return
+        if not self.is_admin(user):
+            if not current_password:
+                self.send_json({"error": "current password is required"}, status=400)
+                return
+            if not self.auth_store.verify_user(user.get("username"), current_password):
+                self.send_json({"error": "current password is incorrect"}, status=403)
+                return
+
+        updated = self.auth_store.update_existing_password(target_username, new_password)
+        if not updated:
+            self.send_json({"error": "user not found"}, status=404)
+            return
+
+        machine_sync = self.sync_machine_passwords(updated["username"], new_password) if sync_machine else []
+        failed = [item for item in machine_sync if item.get("status") == "error"]
+        skipped = [item for item in machine_sync if item.get("status") == "skipped"]
+        self.send_json(
+            {
+                "ok": True,
+                "user": {
+                    "username": updated["username"],
+                    "role": updated["role"],
+                    "display_name": updated["display_name"],
+                },
+                "machine_sync": machine_sync,
+                "machine_sync_summary": {
+                    "total": len(machine_sync),
+                    "ok": len([item for item in machine_sync if item.get("status") == "ok"]),
+                    "failed": len(failed),
+                    "skipped": len(skipped),
+                },
+            }
+        )
+
     def provision_payload(self, data, request=None):
         account_type = str(data.get("account_type") or data.get("request_type") or (request or {}).get("request_type") or "temporary").strip()
         if account_type not in ("temporary", "access"):
@@ -1540,6 +1741,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "authentication is disabled"}, status=404)
                 return
             self.provision_direct_account(user)
+            return
+
+        if route == "/api/password":
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.change_password(user)
             return
 
         if route == "/api/users":

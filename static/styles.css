@@ -136,6 +136,20 @@ label {
   font-weight: 700;
 }
 
+.checkbox-line {
+  display: flex;
+  align-items: center;
+  min-height: 42px;
+  gap: 8px;
+}
+
+.checkbox-line input {
+  width: auto;
+  height: auto;
+  min-height: 0;
+  margin: 0;
+}
+
 select,
 input {
   height: 42px;
@@ -495,6 +509,11 @@ summary:focus-visible {
 .request-form label {
   display: grid;
   gap: 6px;
+}
+
+.request-form label.checkbox-line {
+  display: flex;
+  align-items: center;
 }
 
 .form-grid {

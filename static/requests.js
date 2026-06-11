@@ -2,6 +2,7 @@ const state = {
   user: null,
   requests: [],
   machines: [],
+  users: [],
   page: "submit",
   kind: "temporary",
 };
@@ -13,6 +14,7 @@ const els = {
   pageTabs: document.querySelector("#pageTabs"),
   submitPage: document.querySelector("#submitPage"),
   reviewPage: document.querySelector("#reviewPage"),
+  passwordPage: document.querySelector("#passwordPage"),
   accountsPage: document.querySelector("#accountsPage"),
   temporaryForm: document.querySelector("#temporaryForm"),
   accessForm: document.querySelector("#accessForm"),
@@ -21,6 +23,8 @@ const els = {
   ownerName: document.querySelector("#ownerName"),
   directProvisionForm: document.querySelector("#directProvisionForm"),
   directProvisionMessage: document.querySelector("#directProvisionMessage"),
+  passwordForm: document.querySelector("#passwordForm"),
+  passwordMessage: document.querySelector("#passwordMessage"),
   userForm: document.querySelector("#userForm"),
   userFormMessage: document.querySelector("#userFormMessage"),
   userList: document.querySelector("#userList"),
@@ -94,6 +98,7 @@ function setPage(page) {
   state.page = page;
   els.submitPage.hidden = page !== "submit";
   els.reviewPage.hidden = page !== "review";
+  els.passwordPage.hidden = page !== "password";
   els.accountsPage.hidden = page !== "accounts";
   document.querySelectorAll(".tab-button").forEach((button) => {
     button.classList.toggle("active", button.dataset.page === page);
@@ -326,6 +331,8 @@ function renderRequests() {
 }
 
 function renderUsers(users) {
+  state.users = users;
+  renderPasswordUsers();
   els.userList.innerHTML = users.length
     ? users
         .map((user) => {
@@ -335,6 +342,19 @@ function renderUsers(users) {
         })
         .join("")
     : `<div class="empty">暂无用户</div>`;
+}
+
+function renderPasswordUsers() {
+  const select = els.passwordForm.elements.username;
+  select.innerHTML = state.users
+    .map((user) => {
+      const label = user.display_name ? `${user.username} · ${user.display_name}` : user.username;
+      return `<option value="${escapeHtml(user.username)}">${escapeHtml(label)}</option>`;
+    })
+    .join("");
+  if (state.user?.role === "admin" && state.user.username) {
+    select.value = state.user.username;
+  }
 }
 
 async function loadRequests() {
@@ -370,6 +390,36 @@ function syncDirectProvisionDuration() {
   input.required = isTemporary;
   if (isTemporary && !input.value) input.value = "24";
   if (!isTemporary) input.value = "";
+}
+
+function syncPasswordFormRole() {
+  const isAdmin = state.user?.role === "admin";
+  const adminField = els.passwordForm.querySelector("[data-password-admin]");
+  const currentField = els.passwordForm.querySelector("[data-password-current]");
+  const username = els.passwordForm.elements.username;
+  const currentPassword = els.passwordForm.elements.current_password;
+  adminField.hidden = !isAdmin;
+  username.disabled = !isAdmin;
+  username.required = isAdmin;
+  currentField.hidden = isAdmin;
+  currentPassword.disabled = isAdmin;
+  currentPassword.required = !isAdmin;
+}
+
+function passwordResultMessage(result) {
+  const summary = result.machine_sync_summary || {};
+  const lines = ["密码已更新"];
+  if (summary.total) {
+    lines.push(`机器同步：成功 ${summary.ok || 0} / 失败 ${summary.failed || 0} / 跳过 ${summary.skipped || 0}`);
+    (result.machine_sync || []).forEach((item) => {
+      if (item.status !== "ok") {
+        lines.push(`${item.machine_label || item.machine_key}: ${item.message || item.status}`);
+      }
+    });
+  } else {
+    lines.push("未找到同名机器账号，已只更新网页登录密码");
+  }
+  return escapeHtml(lines.join("\n")).replaceAll("\n", "<br />");
 }
 
 async function submitRequest(form, requestType, messageElement) {
@@ -413,9 +463,11 @@ async function start() {
     });
     document.querySelector('[data-page="review"]').textContent = "申请审批";
     await loadUsers();
+    syncPasswordFormRole();
     setPage("review");
   } else {
     els.dashboardLink.hidden = true;
+    syncPasswordFormRole();
     setPage("submit");
   }
 }
@@ -484,6 +536,38 @@ els.directProvisionForm.addEventListener("submit", async (event) => {
 });
 
 els.directProvisionForm.elements.account_type.addEventListener("change", syncDirectProvisionDuration);
+els.passwordForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  showMessage(els.passwordMessage, "");
+  const form = els.passwordForm;
+  const newPassword = form.elements.new_password.value;
+  const confirmPassword = form.elements.confirm_password.value;
+  if (newPassword !== confirmPassword) {
+    showMessage(els.passwordMessage, "两次输入的新密码不一致", true);
+    return;
+  }
+  const payload = {
+    new_password: newPassword,
+    sync_machine_password: form.elements.sync_machine_password.checked,
+  };
+  if (state.user?.role === "admin") {
+    payload.username = form.elements.username.value;
+  } else {
+    payload.current_password = form.elements.current_password.value;
+  }
+  try {
+    const result = await fetchJson("/api/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    form.reset();
+    syncPasswordFormRole();
+    showMessage(els.passwordMessage, passwordResultMessage(result));
+  } catch (error) {
+    showMessage(els.passwordMessage, escapeHtml(error.message || "更新失败"), true);
+  }
+});
 els.reloadButton.addEventListener("click", loadRequests);
 els.logoutButton.addEventListener("click", async () => {
   await fetch("/api/auth/logout", { method: "POST", cache: "no-store" }).catch(() => {});

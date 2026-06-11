@@ -215,6 +215,60 @@ class AuthStore:
                     for row in cur.fetchall()
                 ]
 
+    def get_user_by_username(self, username):
+        username = str(username or "").strip()
+        if not username:
+            return None
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, username, role, display_name, is_active, created_at, last_login_at
+                    FROM probe_users
+                    WHERE lower(username) = lower(%s)
+                    """,
+                    (username,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return {
+                    "id": row[0],
+                    "username": row[1],
+                    "role": row[2],
+                    "display_name": row[3],
+                    "is_active": row[4],
+                    "created_at": row[5].isoformat() if row[5] else None,
+                    "last_login_at": row[6].isoformat() if row[6] else None,
+                }
+
+    def update_existing_password(self, username, password):
+        username = str(username or "").strip()
+        if not username:
+            return None
+        hashed = password_hash(password)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE probe_users
+                    SET password_hash = %s
+                    WHERE lower(username) = lower(%s)
+                    RETURNING id, username, role, display_name, is_active
+                    """,
+                    (hashed, username),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return {
+                    "id": row[0],
+                    "username": row[1],
+                    "role": row[2],
+                    "display_name": row[3],
+                    "is_active": row[4],
+                }
+
     def verify_user(self, username, password):
         with self.connect() as conn:
             with conn.cursor() as cur:
@@ -315,6 +369,23 @@ class AuthStore:
                     ),
                 )
                 return cur.fetchone()[0]
+
+    def machine_accounts_for_username(self, username):
+        username = str(username or "").strip()
+        if not username:
+            return []
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, display_name, username, machine_key, machine_label, source, metadata, created_at, updated_at
+                    FROM probe_machine_accounts
+                    WHERE lower(username) = lower(%s)
+                    ORDER BY machine_label NULLS LAST, machine_key
+                    """,
+                    (username,),
+                )
+                return [self.machine_account_dict(row) for row in cur.fetchall()]
 
     def find_existing_accounts(self, display_name="", target_machine="", account_name=""):
         display_name = str(display_name or "").strip()

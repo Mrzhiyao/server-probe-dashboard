@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Request Center - Server Probe Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260611-review" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260611-password" />
   </head>
   <body>
     <div class="app-shell">
@@ -29,6 +29,7 @@
       <nav id="pageTabs" class="page-tabs" aria-label="申请中心页面">
         <button class="tab-button" type="button" data-page="submit" data-user-only>提交申请</button>
         <button class="tab-button" type="button" data-page="review">我的申请</button>
+        <button class="tab-button" type="button" data-page="password">修改密码</button>
         <button class="tab-button" type="button" data-page="accounts" data-admin-only hidden>账号管理</button>
       </nav>
 
@@ -97,6 +98,28 @@
           </section>
         </section>
 
+        <section id="passwordPage" class="page-view" hidden>
+          <section class="request-panel wide">
+            <div class="panel-head">
+              <h2>修改密码</h2>
+              <span>同时同步同名机器账号密码</span>
+            </div>
+            <form id="passwordForm" class="request-form">
+              <div class="form-grid">
+                <label data-password-admin>目标用户 <select name="username"></select></label>
+                <label data-password-current>当前密码 <input name="current_password" type="password" autocomplete="current-password" /></label>
+                <label>新密码 <input name="new_password" type="password" autocomplete="new-password" required /></label>
+              </div>
+              <div class="form-grid">
+                <label>确认新密码 <input name="confirm_password" type="password" autocomplete="new-password" required /></label>
+                <label class="checkbox-line"><input name="sync_machine_password" type="checkbox" checked /> 同步机器账号</label>
+              </div>
+              <button class="button" type="submit">更新密码</button>
+              <p id="passwordMessage" class="form-message"></p>
+            </form>
+          </section>
+        </section>
+
         <section id="accountsPage" class="page-view" hidden>
           <section class="request-panel wide">
             <div class="panel-head">
@@ -149,6 +172,6 @@
         </section>
       </main>
     </div>
-    <script src="/static/requests.js?v=20260611-review"></script>
+    <script src="/static/requests.js?v=20260611-password"></script>
   </body>
 </html>
