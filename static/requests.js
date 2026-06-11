@@ -167,16 +167,22 @@ function existingAccountsHtml(accounts) {
     .join("<br />");
 }
 
+function isActionableAdminRequest(request) {
+  return ["pending", "approved"].includes(request.status);
+}
+
 function adminControls(request) {
   if (state.user?.role !== "admin") return "";
+  if (!isActionableAdminRequest(request)) return "";
   const recommended = request.recommendation?.candidates?.[0]?.server_id || "";
   const selectedMachine = request.target_machine || recommended;
   const accountType = request.request_type === "access" ? "access" : "temporary";
+  const canProvision = request.status === "approved";
   const durationInput =
     accountType === "temporary"
       ? `<input name="duration_hours" type="number" min="1" step="1" value="${escapeHtml(request.duration_hours || 24)}" />`
       : `<input name="duration_hours" type="hidden" value="" />`;
-  return `<form class="decision-form" data-id="${request.id}">
+  const decisionForm = `<form class="decision-form" data-id="${request.id}">
     <select name="status">
       ${["pending", "approved", "allocated", "rejected"]
         .map((status) => `<option value="${status}"${request.status === status ? " selected" : ""}>${statusText(status)}</option>`)
@@ -189,7 +195,10 @@ function adminControls(request) {
     <input name="allocation_note" placeholder="分配说明，如机器/账号/到期时间" value="${escapeHtml(request.allocation_note || "")}" />
     <input name="admin_note" placeholder="管理员备注" value="${escapeHtml(request.admin_note || "")}" />
     <button class="button" type="submit">保存</button>
-  </form>
+  </form>`;
+  if (!canProvision) return decisionForm;
+
+  return `${decisionForm}
   <form class="provision-form" data-id="${request.id}">
     <input type="hidden" name="account_type" value="${accountType}" />
     <select name="target_machine" required>
@@ -269,7 +278,10 @@ function renderRequests() {
   els.approvedCount.textContent = counts.approved;
   els.rejectedCount.textContent = counts.rejected;
   els.requestListTitle.textContent = state.user?.role === "admin" ? "申请审批" : "我的申请";
-  els.requestList.innerHTML = state.requests.length ? state.requests.map(requestCard).join("") : `<div class="empty">暂无申请</div>`;
+  const visibleRequests =
+    state.user?.role === "admin" ? state.requests.filter(isActionableAdminRequest) : state.requests;
+  const emptyText = state.user?.role === "admin" ? "暂无待处理申请" : "暂无申请";
+  els.requestList.innerHTML = visibleRequests.length ? visibleRequests.map(requestCard).join("") : `<div class="empty">${emptyText}</div>`;
   document.querySelectorAll(".decision-form").forEach((form) => {
     const saveDecision = async () => {
       const payload = formPayload(form);
