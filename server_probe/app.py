@@ -1324,7 +1324,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "invalid role"}, status=400)
             return
         self.auth_store.set_password(username, password, role=role, display_name=display_name or None)
-        self.send_json({"ok": True, "user": {"username": username, "role": role, "display_name": display_name}}, status=201)
+        machine_sync = self.sync_machine_passwords(username, password)
+        self.send_json(
+            {
+                "ok": True,
+                "user": {"username": username, "role": role, "display_name": display_name},
+                "machine_sync": machine_sync,
+                "machine_sync_summary": {
+                    "total": len(machine_sync),
+                    "ok": len([item for item in machine_sync if item.get("status") == "ok"]),
+                    "failed": len([item for item in machine_sync if item.get("status") == "error"]),
+                    "skipped": len([item for item in machine_sync if item.get("status") == "skipped"]),
+                },
+            },
+            status=201,
+        )
+
+    def sync_dashboard_user_for_machine_account(self, payload):
+        display_name = payload.get("owner_name") or ""
+        # role=None preserves an existing role while creating new users with the default user role.
+        self.auth_store.set_password(payload["username"], payload["password"], role=None, display_name=display_name or None)
 
     def sync_machine_passwords(self, username, password):
         accounts = self.auth_store.machine_accounts_for_username(username)
@@ -1515,6 +1534,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "shell": result.get("shell"),
                 },
             )
+            self.sync_dashboard_user_for_machine_account(payload)
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
             return
@@ -1550,6 +1570,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "shell": result.get("shell"),
                 },
             )
+            self.sync_dashboard_user_for_machine_account(payload)
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
             return

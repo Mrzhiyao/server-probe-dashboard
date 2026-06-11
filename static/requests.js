@@ -8,6 +8,7 @@ const state = {
 };
 
 const els = {
+  toast: document.querySelector("#toast"),
   dashboardLink: document.querySelector("#dashboardLink"),
   userBadge: document.querySelector("#userBadge"),
   logoutButton: document.querySelector("#logoutButton"),
@@ -322,9 +323,12 @@ function renderRequests() {
         });
         const account = result.request?.allocation_note || "账号已开通";
         showMessage(message, escapeHtml(account).replaceAll("\n", "<br />"));
+        showToast("账号已开通，网页登录用户已同步");
         await loadRequests();
+        await loadUsers();
       } catch (error) {
         showMessage(message, escapeHtml(error.message || "开通失败"), true);
+        showToast(error.message || "开通失败", true);
       }
     });
   });
@@ -380,6 +384,16 @@ function showMessage(element, message, isError = false) {
   element.classList.toggle("error", isError);
 }
 
+function showToast(message, isError = false) {
+  els.toast.innerHTML = escapeHtml(message).replaceAll("\n", "<br />");
+  els.toast.classList.toggle("error", isError);
+  els.toast.hidden = false;
+  window.clearTimeout(showToast.timer);
+  showToast.timer = window.setTimeout(() => {
+    els.toast.hidden = true;
+  }, isError ? 8000 : 5200);
+}
+
 function syncDirectProvisionDuration() {
   const type = els.directProvisionForm.elements.account_type.value;
   const field = els.directProvisionForm.querySelector("[data-duration-field]");
@@ -418,6 +432,22 @@ function passwordResultMessage(result) {
     });
   } else {
     lines.push("未找到同名机器账号，已只更新网页登录密码");
+  }
+  return escapeHtml(lines.join("\n")).replaceAll("\n", "<br />");
+}
+
+function userCreateResultMessage(result) {
+  const summary = result.machine_sync_summary || {};
+  const lines = ["用户已创建或重置"];
+  if (summary.total) {
+    lines.push(`机器密码同步：成功 ${summary.ok || 0} / 失败 ${summary.failed || 0} / 跳过 ${summary.skipped || 0}`);
+    (result.machine_sync || []).forEach((item) => {
+      if (item.status !== "ok") {
+        lines.push(`${item.machine_label || item.machine_key}: ${item.message || item.status}`);
+      }
+    });
+  } else {
+    lines.push("未找到同名机器账号，已只更新网页登录用户");
   }
   return escapeHtml(lines.join("\n")).replaceAll("\n", "<br />");
 }
@@ -497,16 +527,18 @@ els.userForm.addEventListener("submit", async (event) => {
   showMessage(els.userFormMessage, "");
   try {
     const payload = formPayload(els.userForm);
-    await fetchJson("/api/users", {
+    const result = await fetchJson("/api/users", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     els.userForm.reset();
-    showMessage(els.userFormMessage, "用户已创建或重置");
+    showMessage(els.userFormMessage, userCreateResultMessage(result));
+    showToast("用户已创建或重置，列表已刷新");
     await loadUsers();
   } catch (error) {
     showMessage(els.userFormMessage, escapeHtml(error.message || "操作失败"), true);
+    showToast(error.message || "操作失败", true);
   }
 });
 
@@ -526,12 +558,16 @@ els.directProvisionForm.addEventListener("submit", async (event) => {
       `账号：${account.username || ""}`,
       `密码：${account.password || ""}`,
       account.expires_at ? `到期：${account.expires_at}` : "",
+      "网页登录用户已同步",
     ].filter(Boolean);
     showMessage(els.directProvisionMessage, escapeHtml(lines.join("\n")).replaceAll("\n", "<br />"));
+    showToast("机器账号已创建，网页登录用户已同步");
     els.directProvisionForm.reset();
     syncDirectProvisionDuration();
+    await loadUsers();
   } catch (error) {
     showMessage(els.directProvisionMessage, escapeHtml(error.message || "创建失败"), true);
+    showToast(error.message || "创建失败", true);
   }
 });
 
@@ -564,8 +600,11 @@ els.passwordForm.addEventListener("submit", async (event) => {
     form.reset();
     syncPasswordFormRole();
     showMessage(els.passwordMessage, passwordResultMessage(result));
+    showToast("密码已更新");
+    await loadUsers();
   } catch (error) {
     showMessage(els.passwordMessage, escapeHtml(error.message || "更新失败"), true);
+    showToast(error.message || "更新失败", true);
   }
 });
 els.reloadButton.addEventListener("click", loadRequests);
