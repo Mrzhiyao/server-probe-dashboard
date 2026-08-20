@@ -383,13 +383,14 @@ function gpuBreakdown(metrics) {
   const cards = devices
     .map((device) => {
       const index = device.index === null || device.index === undefined ? "?" : device.index;
+      const name = device.name || "GPU";
       const util = device.utilization_percent;
       const memory = device.memory_percent;
       const temp = device.temperature_c === null || device.temperature_c === undefined ? "N/A" : `${device.temperature_c}°C`;
       return `<div class="gpu-unit">
         <div class="gpu-mini-head">
           <strong>GPU ${escapeHtml(index)}</strong>
-          <span>${escapeHtml(device.name || "GPU")}</span>
+          <span title="${escapeHtml(name)}">${escapeHtml(name)}</span>
         </div>
         <div class="gpu-mini-meter">
           <div><span>算力</span><b>${fmtPercent(util)}</b></div>
@@ -413,6 +414,10 @@ function gpuBreakdown(metrics) {
 function gpuSummaryLabel(metrics) {
   const devices = gpuDevices(metrics);
   if (!devices.length) return "无 GPU 数据";
+  if (devices.length === 1) {
+    const device = devices[0];
+    return `${device.name || "GPU"} · 算力 ${fmtPercent(device.utilization_percent)} · 显存 ${fmtPercent(device.memory_percent)}`;
+  }
   return `${devices.length}卡 · 平均算力 ${fmtPercent(averageGpuUtil(metrics))} · 总显存 ${fmtPercent(
     aggregateGpuMemory(metrics)
   )} · 最忙单卡 ${fmtPercent(hottestGpuValue(metrics))}`;

@@ -547,6 +547,11 @@ def tegrastats_sample():
     return ""
 
 
+def jetson_device_name():
+    model = read_first("/proc/device-tree/model").replace("\x00", "").strip()
+    return model or "Jetson integrated GPU"
+
+
 def jetson_gpu_info():
     output = tegrastats_sample()
     if not output:
@@ -560,7 +565,7 @@ def jetson_gpu_info():
     device = {
         "index": "0",
         "uuid": "jetson-integrated",
-        "name": "Jetson integrated GPU",
+        "name": jetson_device_name(),
         "utilization_percent": numeric(gpu_match.group(1)) if gpu_match else None,
         "memory_total_bytes": int(total_mb * 1024 * 1024) if total_mb is not None else None,
         "memory_used_bytes": int(used_mb * 1024 * 1024) if used_mb is not None else None,
@@ -577,6 +582,7 @@ def gpu_info():
     if nvidia and jetson:
         jetson_device = jetson["devices"][0]
         for device in nvidia.get("devices", []):
+            device["name"] = jetson_device.get("name") or device.get("name")
             if device.get("utilization_percent") is None:
                 device["utilization_percent"] = jetson_device.get("utilization_percent")
             if device.get("memory_percent") is None:

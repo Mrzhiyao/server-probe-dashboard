@@ -1111,9 +1111,9 @@ textarea:focus {
 }
 
 .gpu-mini-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
   gap: 8px;
   margin-bottom: 8px;
 }
@@ -1127,9 +1127,9 @@ textarea:focus {
   min-width: 0;
   color: var(--muted);
   font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+  text-align: right;
 }
 
 .gpu-mini-meter {
