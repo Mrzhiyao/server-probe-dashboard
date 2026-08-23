@@ -4,6 +4,12 @@ const state = {
   groups: [],
   refreshSeconds: 60,
   historyRetentionPoints: 240,
+  persistentHistory: { enabled: false },
+  historyRangeHours: [4, 24, 168, 720].includes(Number(localStorage.getItem("serverProbe.historyHours")))
+    ? Number(localStorage.getItem("serverProbe.historyHours"))
+    : 4,
+  historyOverride: null,
+  historyLoading: false,
   alertThresholds: {},
   timer: null,
   clockTimer: null,
@@ -24,6 +30,7 @@ const els = {
   groupFilter: document.querySelector("#groupFilter"),
   searchInput: document.querySelector("#searchInput"),
   sortSelect: document.querySelector("#sortSelect"),
+  historyRange: document.querySelector("#historyRange"),
   refreshButton: document.querySelector("#refreshButton"),
   requestLink: document.querySelector("#requestLink"),
   logoutButton: document.querySelector("#logoutButton"),
@@ -483,7 +490,7 @@ function renderCardAlerts(result) {
 }
 
 function historySamples(result) {
-  const history = state.snapshot?.history || {};
+  const history = state.historyOverride || state.snapshot?.history || {};
   return history[result.id] || [];
 }
 
@@ -516,7 +523,7 @@ function historyWindowText(samples) {
 }
 
 function historyPanel(result) {
-  const samples = historySamples(result).slice(-90);
+  const samples = historySamples(result).slice(-240);
   const hasHistory = samples.filter((sample) => sample.status === "online").length >= 2;
   const width = 260;
   const height = 62;
@@ -1013,14 +1020,49 @@ async function loadMeta() {
   state.groups = meta.groups || [];
   state.refreshSeconds = Number(meta.refresh_seconds || 60);
   state.historyRetentionPoints = Number(meta.history_retention_points || 240);
+  state.persistentHistory = meta.persistent_history || { enabled: false };
   state.alertThresholds = meta.alert_thresholds || {};
   const title = meta.title || "Server Probe Dashboard";
   document.title = title;
   els.pageTitle.textContent = title;
+  if (els.historyRange) {
+    if (!state.persistentHistory.enabled) state.historyRangeHours = 4;
+    els.historyRange.value = String(state.historyRangeHours);
+    [...els.historyRange.options].forEach((option) => {
+      option.disabled = Number(option.value) > 4 && !state.persistentHistory.enabled;
+    });
+  }
   renderRefreshState();
   els.groupFilter.innerHTML = `<option value="all">全部</option>${state.groups
     .map((group) => `<option value="${escapeHtml(group)}">${escapeHtml(group)}</option>`)
     .join("")}`;
+}
+
+async function loadHistoryRange(persist = true) {
+  if (!els.historyRange || state.historyLoading) return;
+  const hours = Number(els.historyRange.value || 4);
+  state.historyRangeHours = [4, 24, 168, 720].includes(hours) ? hours : 4;
+  if (persist) localStorage.setItem("serverProbe.historyHours", String(state.historyRangeHours));
+  if (state.historyRangeHours <= 4 || !state.persistentHistory.enabled) {
+    state.historyOverride = null;
+    render();
+    return;
+  }
+  state.historyLoading = true;
+  els.historyRange.disabled = true;
+  try {
+    const payload = await fetchJson(`/api/history?hours=${state.historyRangeHours}&max_points=240`);
+    state.historyOverride = payload.history || {};
+    state.persistentHistory = payload.persistent_history || state.persistentHistory;
+    render();
+  } catch (error) {
+    state.historyOverride = null;
+    els.lastUpdated.textContent = `历史加载失败：${error.message}`;
+    render();
+  } finally {
+    state.historyLoading = false;
+    els.historyRange.disabled = false;
+  }
 }
 
 async function loadSnapshot(force = false) {
@@ -1037,6 +1079,7 @@ async function loadSnapshot(force = false) {
       els.lastUpdated.textContent = `缓存 ${fmtTime(state.snapshot.generated_at)}${refreshHint}`;
     }
     render();
+    if (state.historyRangeHours > 4 && state.persistentHistory.enabled) await loadHistoryRange(false);
     if (state.snapshot.cache?.refreshing) {
       window.setTimeout(() => loadSnapshot(false), 2500);
     }
@@ -1098,6 +1141,7 @@ els.autoRefresh.addEventListener("change", schedule);
 els.groupFilter.addEventListener("change", render);
 els.searchInput.addEventListener("input", render);
 els.sortSelect.addEventListener("change", render);
+els.historyRange?.addEventListener("change", () => loadHistoryRange(true));
 els.viewTabs.forEach((button) => button.addEventListener("click", () => setActiveView(button.dataset.view)));
 
 (async function start() {

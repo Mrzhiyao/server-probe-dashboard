@@ -8,6 +8,7 @@ A lightweight SSH-based Linux resource dashboard. The dashboard host periodicall
 - CPU, memory, GPU utilization, GPU memory, temperature, load average, disk usage, and uptime
 - Storage and NAS view with real-mount detection, inode usage, local disk I/O rates, physical disk inventory, and optional SMART health
 - Per-host history sparklines, current alerts, and per-user GPU usage summaries
+- Optional PostgreSQL metric history with restart recovery, 24-hour, 7-day, and 30-day downsampled views
 - Top CPU, memory, and GPU process tables
 - NVIDIA GPU metrics through `nvidia-smi`
 - Jetson GPU metrics through `tegrastats`
@@ -57,6 +58,22 @@ python -m server_probe.auth set-password alice --role user --display-name "Alice
 ```
 
 Use HTTPS in front of the dashboard when exposing it beyond a trusted LAN.
+
+## Persistent History
+
+Metric history can reuse the authentication PostgreSQL database or use a separate DSN. Data is written once per refresh for each server, restored into the short-term cache after a service restart, and retained for 30 days by default:
+
+```json
+{
+  "history_retention_points": 240,
+  "persistent_history": {
+    "enabled": true,
+    "retention_days": 30
+  }
+}
+```
+
+When authentication and history share PostgreSQL, `PROBE_AUTH_DB_DSN` is sufficient. Set `PROBE_HISTORY_DB_DSN` only when history should use a different database. Environment overrides are also available through `PROBE_HISTORY_ENABLED` and `PROBE_HISTORY_RETENTION_DAYS`.
 
 Logged-in users can submit requests from `/requests`. Normal users see a submit page and their own request list. Admins see an approval page and an account-management page. Admins can grant selected normal users access to the resource dashboard with a per-user permission checkbox. Temporary account requests use the current dashboard snapshot to recommend machines. Long-term access requests can be checked against an imported machine-account index before duplicate requests are created. Admins can provision machine accounts from an approved request or directly from the account-management page when the monitored SSH user, or the optional `provision` SSH user, is root or has sudo permission.
 

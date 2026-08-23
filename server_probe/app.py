@@ -24,6 +24,7 @@ from pathlib import Path
 import paramiko
 
 from server_probe.auth import AuthStore, utc_now
+from server_probe.history import HistoryStore
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -312,7 +313,7 @@ def safe_account_name(value):
 
 
 class Monitor:
-    def __init__(self, config):
+    def __init__(self, config, history_store=None):
         self.config = config
         self.servers = config.get("servers", [])
         self.refresh_seconds = float(config.get("refresh_seconds", 30))
@@ -327,14 +328,33 @@ class Monitor:
         self.history_retention_points = int(config.get("history_retention_points", 240))
         self.history = {}
         self.history_lock = threading.Lock()
+        self.history_store = history_store
+        self.history_store_error = None
+        self.history_cleanup_interval = float(config.get("history_cleanup_interval_seconds", 3600))
+        self.last_history_cleanup_at = 0.0
         self.alert_thresholds = self.load_alert_thresholds()
         self.last_refresh_started_at = None
         self.last_refresh_finished_at = None
         self.refresh_lock = threading.Lock()
         self.collector_source = COLLECTOR_PATH.read_text(encoding="utf-8")
         self.secrets = self._load_known_secrets()
+        self.restore_persistent_history()
         self.background_thread = threading.Thread(target=self.background_refresh_loop, daemon=True)
         self.background_thread.start()
+
+    def restore_persistent_history(self):
+        if self.history_store is None:
+            return
+        try:
+            restored = self.history_store.load_recent(
+                [server.get("id") for server in self.servers],
+                limit_per_server=self.history_retention_points,
+            )
+            with self.history_lock:
+                self.history = restored
+            self.history_store_error = None
+        except Exception as exc:
+            self.history_store_error = str(exc)[:300]
 
     def _load_known_secrets(self):
         values = []
@@ -733,16 +753,30 @@ class Monitor:
         return alerts
 
     def record_history(self, snapshot):
+        persistent_samples = []
         with self.history_lock:
             for result in snapshot.get("results", []):
                 server_id = result.get("id")
                 if not server_id:
                     continue
                 samples = self.history.setdefault(server_id, [])
-                samples.append(self.history_sample(result))
+                sample = self.history_sample(result)
+                samples.append(sample)
+                persistent_samples.append((server_id, sample))
                 overflow = len(samples) - self.history_retention_points
                 if overflow > 0:
                     del samples[:overflow]
+        if self.history_store is None:
+            return
+        try:
+            self.history_store.append_samples(persistent_samples)
+            now = time.monotonic()
+            if now - self.last_history_cleanup_at >= self.history_cleanup_interval:
+                self.history_store.cleanup()
+                self.last_history_cleanup_at = now
+            self.history_store_error = None
+        except Exception as exc:
+            self.history_store_error = str(exc)[:300]
 
     def history_sample(self, result):
         sample = {
@@ -752,6 +786,17 @@ class Monitor:
         metrics = result.get("metrics") or {}
         gpu = self.gpu_stats(metrics)
         if result.get("status") == "online":
+            storage = metrics.get("storage") or {}
+            compact_mounts = {}
+            for mount in storage.get("mounts") or []:
+                path = mount.get("mount")
+                if not path:
+                    continue
+                compact_mounts[path] = {
+                    "status": mount.get("status"),
+                    "percent": rounded(mount.get("percent")),
+                    "inode_percent": rounded(mount.get("inode_percent")),
+                }
             sample.update(
                 {
                     "cpu": rounded(metrics.get("cpu", {}).get("percent")),
@@ -761,13 +806,38 @@ class Monitor:
                     "gpu_peak": gpu.get("peak"),
                     "disk": rounded(metrics.get("disk", {}).get("percent")),
                     "load1": rounded(metrics.get("cpu", {}).get("load1")),
+                    "storage": {
+                        "mount_issue_count": int_or_none((storage.get("summary") or {}).get("mount_issue_count")) or 0,
+                        "smart_issue_count": int_or_none((storage.get("summary") or {}).get("smart_issue_count")) or 0,
+                        "mounts": compact_mounts,
+                    },
                 }
             )
         return sample
 
-    def history_payload(self):
+    def history_payload(self, hours=None, max_points=240):
+        if hours is not None and self.history_store is not None:
+            try:
+                history = self.history_store.query_range(
+                    [server.get("id") for server in self.servers],
+                    hours=hours,
+                    max_points=max_points,
+                )
+                self.history_store_error = None
+                return history
+            except Exception as exc:
+                self.history_store_error = str(exc)[:300]
         with self.history_lock:
             return {server_id: list(samples) for server_id, samples in self.history.items()}
+
+    def persistent_history_info(self):
+        info = {
+            "enabled": self.history_store is not None,
+            "error": self.history_store_error,
+        }
+        if self.history_store is not None:
+            info["retention_days"] = self.history_store.retention_days
+        return info
 
     def resource_recommendation(self, requirements):
         gpu_count = max(0, int(as_number(requirements.get("gpu_count")) or 0))
@@ -1877,6 +1947,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "title": config.get("title", "Server Probe Dashboard"),
                     "refresh_seconds": self.monitor.refresh_seconds,
                     "history_retention_points": self.monitor.history_retention_points,
+                    "persistent_history": self.monitor.persistent_history_info(),
                     "alert_thresholds": self.monitor.alert_thresholds,
                     "groups": groups,
                     "servers": [public_server(server) for server in self.monitor.servers],
@@ -1894,12 +1965,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if route == "/api/history":
             if not self.require_dashboard_viewer(user):
                 return
+            hours = as_number(query.get("hours", [None])[0])
+            max_points = int(as_number(query.get("max_points", [240])[0]) or 240)
             self.send_json(
                 {
                     "generated_at": utc_now_iso(),
                     "retention_points": self.monitor.history_retention_points,
                     "refresh_seconds": self.monitor.refresh_seconds,
-                    "history": self.monitor.history_payload(),
+                    "range_hours": rounded(hours),
+                    "persistent_history": self.monitor.persistent_history_info(),
+                    "history": self.monitor.history_payload(hours=hours, max_points=max_points),
                 }
             )
             return
@@ -2009,13 +2084,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
-    DashboardHandler.monitor = Monitor(config)
     auth_config = config.get("auth") or {}
     auth_enabled = env_bool("PROBE_AUTH_ENABLED", bool(auth_config.get("enabled", False)))
     DashboardHandler.auth_enabled = auth_enabled
     DashboardHandler.cookie_secure = env_bool("PROBE_AUTH_COOKIE_SECURE", bool(auth_config.get("cookie_secure", False)))
+    dsn = os.getenv("PROBE_AUTH_DB_DSN") or auth_config.get("postgres_dsn")
     if auth_enabled:
-        dsn = os.getenv("PROBE_AUTH_DB_DSN") or auth_config.get("postgres_dsn")
         if not dsn:
             raise RuntimeError("PROBE_AUTH_DB_DSN is required when authentication is enabled")
         session_hours = int(os.getenv("PROBE_AUTH_SESSION_HOURS", auth_config.get("session_hours", 12)))
@@ -2029,6 +2103,19 @@ def main(argv=None):
                 bootstrap_role = "admin"
             auth_store.set_password(bootstrap_user, bootstrap_password, role=bootstrap_role)
         DashboardHandler.auth_store = auth_store
+
+    history_config = config.get("persistent_history") or {}
+    history_enabled = env_bool("PROBE_HISTORY_ENABLED", bool(history_config.get("enabled", False)))
+    history_store = None
+    if history_enabled:
+        history_dsn = os.getenv("PROBE_HISTORY_DB_DSN") or dsn or history_config.get("postgres_dsn")
+        if not history_dsn:
+            raise RuntimeError("a PostgreSQL DSN is required when persistent history is enabled")
+        retention_days = int(os.getenv("PROBE_HISTORY_RETENTION_DAYS", history_config.get("retention_days", 30)))
+        history_store = HistoryStore(history_dsn, retention_days=retention_days)
+        history_store.setup()
+
+    DashboardHandler.monitor = Monitor(config, history_store=history_store)
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     print("Server probe dashboard listening on http://%s:%s" % (args.host, args.port), flush=True)
     server.serve_forever()

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Server Probe Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260823-storage" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260823-history" />
   </head>
   <body>
     <div class="app-shell">
@@ -48,6 +48,15 @@
             <option value="gpu">GPU</option>
             <option value="storage">存储占用</option>
             <option value="status">状态</option>
+          </select>
+        </div>
+        <div class="field history-range-field">
+          <label for="historyRange">历史范围</label>
+          <select id="historyRange">
+            <option value="4">近 4 小时</option>
+            <option value="24">近 24 小时</option>
+            <option value="168">近 7 天</option>
+            <option value="720">近 30 天</option>
           </select>
         </div>
         <button id="refreshButton" class="button" type="button">刷新</button>
@@ -122,6 +131,6 @@
       </article>
     </template>
 
-    <script src="/static/app.js?v=20260823-storage"></script>
+    <script src="/static/app.js?v=20260823-history"></script>
   </body>
 </html>

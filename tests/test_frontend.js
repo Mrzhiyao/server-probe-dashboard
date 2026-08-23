@@ -90,4 +90,16 @@ context.__alert = {
 const alertText = vm.runInContext("alertText(__alert)", context);
 assert.equal(alertText, "/nas · 只有自动挂载占位，真实文件系统未挂载");
 
-console.log("frontend storage rendering checks passed");
+context.__persistentHistory = {
+  "edge-24": [
+    { time: "2026-08-23T10:00:00Z", status: "online", cpu: 10 },
+    { time: "2026-08-23T11:00:00Z", status: "online", cpu: 20 },
+  ],
+};
+const historyCpu = vm.runInContext(
+  'state.snapshot = { history: { "edge-24": [{ cpu: 1 }] } }; state.historyOverride = __persistentHistory; historySamples({ id: "edge-24" }).map((sample) => sample.cpu)',
+  context
+);
+assert.deepEqual(Array.from(historyCpu), [10, 20]);
+
+console.log("frontend storage and history rendering checks passed");
