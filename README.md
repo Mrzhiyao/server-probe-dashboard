@@ -7,6 +7,8 @@ A lightweight SSH-based Linux resource dashboard. The dashboard host periodicall
 - Multi-host dashboard cards
 - CPU, memory, GPU utilization, GPU memory, temperature, load average, disk usage, and uptime
 - Storage and NAS view with real-mount detection, inode usage, local disk I/O rates, physical disk inventory, and optional SMART health
+- Read-only Docker inventory with container resources, image disk usage, GPU process mapping, and expected-container alerts
+- vLLM service discovery with safe argument extraction, model/version details, and local `/health` plus `/v1/models` probing
 - Per-host history sparklines, current alerts, and per-user GPU usage summaries
 - Optional PostgreSQL metric history with restart recovery, 24-hour, 7-day, and 30-day downsampled views
 - Top CPU, memory, and GPU process tables
@@ -114,6 +116,16 @@ Mounts listed in `/etc/fstab` are treated as expected automatically. Manually mo
   ]
 }
 ```
+
+Stopped containers are inventory only and do not alert by default. Add container names to `expected_containers` when a service must remain running:
+
+```json
+{
+  "expected_containers": ["model-api", "postgres"]
+}
+```
+
+Docker collection uses `docker ps`, `docker stats --no-stream`, `docker system df`, and narrowly formatted inspect output. Environment variables and complete commands are never returned to the browser. vLLM detection exposes only allowlisted model/runtime flags and probes local or private container endpoints.
 
 Local filesystem capacity and inode data are collected with short timeouts. Network mounts are never traversed for capacity checks because a stale CIFS/NFS mount can put `stat` or `df` into uninterruptible kernel I/O; their health instead uses mount metadata, CIFS kernel connection state when available, and bounded service-port probes. SMART data appears when `smartctl` is installed and the SSH collector user has permission to read the device.
 

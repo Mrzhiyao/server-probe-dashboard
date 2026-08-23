@@ -15,7 +15,9 @@ const state = {
   clockTimer: null,
   nextRefreshAt: null,
   loading: false,
-  activeView: localStorage.getItem("serverProbe.activeView") === "storage" ? "storage" : "monitor",
+  activeView: ["monitor", "storage", "containers"].includes(localStorage.getItem("serverProbe.activeView"))
+    ? localStorage.getItem("serverProbe.activeView")
+    : "monitor",
 };
 
 const els = {
@@ -47,6 +49,12 @@ const els = {
   storageIssueCount: document.querySelector("#storageIssueCount"),
   storageDeviceCount: document.querySelector("#storageDeviceCount"),
   storageSmartIssueCount: document.querySelector("#storageSmartIssueCount"),
+  containerView: document.querySelector("#containerView"),
+  containerGrid: document.querySelector("#containerGrid"),
+  dockerHostCount: document.querySelector("#dockerHostCount"),
+  runningContainerCount: document.querySelector("#runningContainerCount"),
+  containerIssueCount: document.querySelector("#containerIssueCount"),
+  runningVllmCount: document.querySelector("#runningVllmCount"),
   template: document.querySelector("#serverCardTemplate"),
 };
 
@@ -464,6 +472,15 @@ function alertText(alert) {
     return `${path} · ${message}`;
   }
   if (alert.kind === "smart") return `${alert.device || "磁盘"} · ${alert.message || "SMART 异常"}`;
+  if (["container_expected", "container_restarting", "container_health"].includes(alert.kind)) {
+    const messages = {
+      container_expected: "预期容器未运行",
+      container_restarting: "容器反复重启",
+      container_health: "Docker 健康检查异常",
+    };
+    return `${alert.container || "容器"} · ${messages[alert.kind]}`;
+  }
+  if (alert.kind === "vllm") return `${alert.container || "vLLM"} · ${alert.model || "模型服务"} 接口不可用`;
   if (alert.kind === "mount_latency") {
     return `${alert.path || "网络存储"} 延迟 ${fmtMilliseconds(alert.value)} / 阈值 ${fmtMilliseconds(alert.threshold)}`;
   }
@@ -717,7 +734,12 @@ function filteredResults() {
       const storage = storageMetrics(item);
       const mounts = (storage.mounts || []).map((mount) => `${mount.mount || ""} ${mount.source || ""} ${mount.fstype || ""}`).join(" ");
       const devices = (storage.devices || []).map((device) => `${device.name || ""} ${device.model || ""}`).join(" ");
-      const haystack = `${item.id} ${item.name} ${item.host} ${item.user} ${item.group} ${mounts} ${devices}`.toLowerCase();
+      const docker = dockerMetrics(item);
+      const containers = (docker.containers || [])
+        .map((container) => `${container.name || ""} ${container.image || ""} ${container.vllm?.model || ""}`)
+        .join(" ");
+      const images = (docker.images || []).map((image) => `${image.repository || ""}:${image.tag || ""}`).join(" ");
+      const haystack = `${item.id} ${item.name} ${item.host} ${item.user} ${item.group} ${mounts} ${devices} ${containers} ${images}`.toLowerCase();
       return haystack.includes(search);
     });
   }
@@ -726,6 +748,7 @@ function filteredResults() {
     if (sort === "mem") return Number(b.metrics?.memory?.percent || -1) - Number(a.metrics?.memory?.percent || -1);
     if (sort === "gpu") return Number(aggregateGpuCardValue(b.metrics) || -1) - Number(aggregateGpuCardValue(a.metrics) || -1);
     if (sort === "storage") return storageUsageScore(b) - storageUsageScore(a);
+    if (sort === "containers") return containerIssueScore(b) - containerIssueScore(a);
     if (sort === "status") return healthClass(a).localeCompare(healthClass(b));
     return `${a.group}${a.name}`.localeCompare(`${b.group}${b.name}`);
   });
@@ -944,11 +967,199 @@ function renderStorage(results) {
     : `<div class="empty">没有匹配的机器</div>`;
 }
 
+function dockerMetrics(result) {
+  return result?.metrics?.docker || { available: false, accessible: false, containers: [], images: [], summary: {} };
+}
+
+function containerIssueScore(result) {
+  const docker = dockerMetrics(result);
+  const summary = docker.summary || {};
+  return (
+    Number(summary.expected_issue_count || 0) * 1000 +
+    Number(summary.restarting_count || 0) * 800 +
+    Number(summary.vllm_unhealthy_count || 0) * 700 +
+    Number(summary.unhealthy_count || 0) * 500 +
+    Number(summary.running_count || 0)
+  );
+}
+
+function containerState(container) {
+  const probe = container.vllm?.probe?.status;
+  if (container.expected && !container.running) return { label: "缺失", className: "critical" };
+  if (container.state === "restarting") return { label: "重启中", className: "critical" };
+  if (container.running && container.vllm?.service && probe === "unhealthy") return { label: "接口异常", className: "critical" };
+  if (container.running && container.health === "unhealthy") return { label: "健康异常", className: "warning" };
+  if (container.running && container.health === "healthy") return { label: "健康", className: "healthy" };
+  if (container.running) return { label: "运行中", className: "healthy" };
+  if (container.state === "created") return { label: "已创建", className: "muted" };
+  return { label: "已停止", className: "muted" };
+}
+
+function containerHostClass(result) {
+  if (result.status !== "online") return "offline";
+  const docker = dockerMetrics(result);
+  if (docker.available && !docker.accessible) return "warning";
+  const summary = docker.summary || {};
+  if (Number(summary.expected_issue_count || 0) || Number(summary.restarting_count || 0) || Number(summary.vllm_unhealthy_count || 0)) {
+    return "critical";
+  }
+  if (Number(summary.unhealthy_count || 0)) return "warning";
+  return "healthy";
+}
+
+function containerAge(container) {
+  if (!container.started_at || !container.running) return container.status || "-";
+  const started = new Date(container.started_at);
+  if (Number.isNaN(started.getTime())) return container.status || "-";
+  return secondsText(Math.max(0, (Date.now() - started.getTime()) / 1000));
+}
+
+function renderVllmInfo(container) {
+  const vllm = container.vllm;
+  if (!vllm) return `<span class="container-na">-</span>`;
+  if (!vllm.service) return `<div class="vllm-cell"><strong>vLLM 镜像</strong><span>非服务任务</span></div>`;
+  const probe = vllm.probe || {};
+  const probeText = !container.running
+    ? "未运行"
+    : probe.status === "healthy"
+      ? `接口正常${finiteNumber(probe.latency_ms) === null ? "" : ` · ${fmtMilliseconds(probe.latency_ms)}`}`
+      : probe.status === "not_exposed"
+        ? "端口未暴露"
+        : "接口异常";
+  const version = vllm.version ? `vLLM ${vllm.version}` : vllm.nvidia_release ? `NVIDIA ${vllm.nvidia_release}` : "vLLM";
+  return `<div class="vllm-cell">
+    <strong>${escapeHtml(vllm.model || "未识别模型")}</strong>
+    <span>${escapeHtml(version)} · ${escapeHtml(probeText)}</span>
+    ${probe.endpoint ? `<span>${escapeHtml(probe.endpoint)}</span>` : ""}
+  </div>`;
+}
+
+function renderContainerRow(container) {
+  const status = containerState(container);
+  const gpuText = container.gpu_indices?.length
+    ? `GPU ${container.gpu_indices.join(",")} · ${fmtBytes(container.gpu_memory_used_bytes)}`
+    : "未关联 GPU 进程";
+  const ports = container.ports?.length ? container.ports.join(" · ") : "-";
+  return `<div class="container-row" role="row">
+    <div class="container-cell container-name-cell" role="cell"><strong>${escapeHtml(container.name || container.id || "-")}</strong><span>${escapeHtml(container.id || "")}</span></div>
+    <div class="container-cell container-image-cell" role="cell" title="${escapeHtml(container.image || "")}">${escapeHtml(container.image || "-")}</div>
+    <div class="container-cell" role="cell"><span class="container-state ${status.className}">${status.label}</span><small>${escapeHtml(containerAge(container))}</small></div>
+    <div class="container-cell resource-cell" role="cell"><span>CPU ${fmtPercent(container.cpu_percent)}</span><span>内存 ${fmtPercent(container.memory_percent)} · ${fmtBytes(container.memory_used_bytes)}</span></div>
+    <div class="container-cell gpu-container-cell" role="cell">${escapeHtml(gpuText)}</div>
+    <div class="container-cell io-container-cell" role="cell"><span>网络 ${fmtBytes(container.network_rx_bytes)} / ${fmtBytes(container.network_tx_bytes)}</span><span>块 I/O ${fmtBytes(container.block_read_bytes)} / ${fmtBytes(container.block_write_bytes)}</span></div>
+    <div class="container-cell ports-cell" role="cell">${escapeHtml(ports)}</div>
+    <div class="container-cell" role="cell">${renderVllmInfo(container)}</div>
+  </div>`;
+}
+
+function renderContainerTable(containers, label) {
+  if (!containers.length) return `<div class="container-inline-empty">${escapeHtml(label || "暂无容器")}</div>`;
+  return `<div class="container-table" role="table">
+    <div class="container-table-head" role="row"><span>容器</span><span>镜像</span><span>状态</span><span>资源</span><span>GPU</span><span>网络 / I/O</span><span>端口</span><span>vLLM 服务</span></div>
+    ${containers.map(renderContainerRow).join("")}
+  </div>`;
+}
+
+function renderImageList(images) {
+  if (!images.length) return `<div class="container-inline-empty">暂无镜像数据</div>`;
+  return `<div class="image-list">${images
+    .slice(0, 50)
+    .map(
+      (image) => `<div><strong>${escapeHtml(`${image.repository || "<none>"}:${image.tag || "<none>"}`)}</strong><span>${fmtBytes(
+        image.size_bytes
+      )}${image.vllm ? " · vLLM" : ""}</span></div>`
+    )
+    .join("")}</div>`;
+}
+
+function renderContainerHost(result) {
+  const docker = dockerMetrics(result);
+  const summary = docker.summary || {};
+  const containers = docker.containers || [];
+  const ordered = [...containers].sort((a, b) => {
+    const rank = (item) => {
+      const status = containerState(item).className;
+      if (status === "critical" || status === "warning") return 0;
+      if (item.running && item.vllm?.service) return 1;
+      if (item.running) return 2;
+      if (item.vllm?.service || item.expected) return 3;
+      return 4;
+    };
+    return rank(a) - rank(b) || String(a.name || "").localeCompare(String(b.name || ""));
+  });
+  const primary = ordered.slice(0, 30);
+  const archived = ordered.slice(30);
+  const imageDisk = docker.disk_usage?.images || {};
+  let body = "";
+  if (result.status !== "online") {
+    body = `<div class="container-host-error">${escapeHtml(result.error || "主机无法采集")}</div>`;
+  } else if (!docker.available) {
+    body = `<div class="container-host-error muted">未安装 Docker</div>`;
+  } else if (!docker.accessible) {
+    const reason = docker.reason === "permission_denied" ? "采集账号没有 Docker 权限" : "Docker 服务不可用";
+    body = `<div class="container-host-error warning">${reason}</div>`;
+  } else {
+    body = `${renderContainerTable(primary, "当前没有运行中的容器")}
+      ${
+        archived.length
+          ? `<details class="container-archive"><summary>其余 ${archived.length} 个容器</summary>${renderContainerTable(archived)}</details>`
+          : ""
+      }
+      <details class="container-images">
+        <summary>镜像 ${summary.image_count || 0} 个 · ${fmtBytes(imageDisk.size_bytes)} · 可回收 ${fmtBytes(imageDisk.reclaimable_bytes)}</summary>
+        ${renderImageList(docker.images || [])}
+      </details>`;
+  }
+  const issueCount =
+    Number(summary.expected_issue_count || 0) +
+    Number(summary.restarting_count || 0) +
+    Number(summary.unhealthy_count || 0) +
+    Number(summary.vllm_unhealthy_count || 0);
+  const hostLabel = result.status !== "online" ? "主机离线" : !docker.accessible ? "Docker 不可用" : issueCount ? `${issueCount} 项异常` : "容器正常";
+  return `<section class="container-host ${containerHostClass(result)}">
+    <div class="container-host-head">
+      <div><span>${escapeHtml(result.group || "")}</span><h2>${escapeHtml(result.name || result.id)}</h2><p>${escapeHtml(
+        result.host || "local"
+      )}${docker.version ? ` · Docker ${escapeHtml(docker.version)}` : ""}</p></div>
+      <div><strong>${escapeHtml(hostLabel)}</strong><span>${summary.running_count || 0} 运行 · ${summary.vllm_running_count || 0} vLLM</span></div>
+    </div>
+    ${body}
+  </section>`;
+}
+
+function renderContainers(results) {
+  if (!els.containerGrid) return;
+  const totals = results.reduce(
+    (acc, result) => {
+      const docker = dockerMetrics(result);
+      const summary = docker.summary || {};
+      if (docker.accessible) acc.hosts += 1;
+      acc.running += Number(summary.running_count || 0);
+      acc.issues +=
+        Number(summary.expected_issue_count || 0) +
+        Number(summary.restarting_count || 0) +
+        Number(summary.unhealthy_count || 0) +
+        Number(summary.vllm_unhealthy_count || 0);
+      acc.vllm += Number(summary.vllm_running_count || 0);
+      return acc;
+    },
+    { hosts: 0, running: 0, issues: 0, vllm: 0 }
+  );
+  els.dockerHostCount.textContent = totals.hosts;
+  els.runningContainerCount.textContent = totals.running;
+  els.containerIssueCount.textContent = totals.issues;
+  els.runningVllmCount.textContent = totals.vllm;
+  els.containerGrid.innerHTML = results.length
+    ? results.map(renderContainerHost).join("")
+    : `<div class="empty">没有匹配的机器</div>`;
+}
+
 function setActiveView(view, persist = true) {
-  state.activeView = view === "storage" ? "storage" : "monitor";
+  state.activeView = ["monitor", "storage", "containers"].includes(view) ? view : "monitor";
   if (persist) localStorage.setItem("serverProbe.activeView", state.activeView);
   if (els.monitorView) els.monitorView.hidden = state.activeView !== "monitor";
   if (els.storageView) els.storageView.hidden = state.activeView !== "storage";
+  if (els.containerView) els.containerView.hidden = state.activeView !== "containers";
   els.viewTabs.forEach((button) => {
     const active = button.dataset.view === state.activeView;
     button.classList.toggle("active", active);
@@ -974,6 +1185,7 @@ function render() {
   els.offlineCount.textContent = counts.offline;
   renderAlertPanel();
   renderStorage(results);
+  renderContainers(results);
   setActiveView(state.activeView, false);
   els.serverGrid.innerHTML = "";
   els.serverGrid.classList.remove("sectioned");

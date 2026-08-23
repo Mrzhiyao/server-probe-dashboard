@@ -51,6 +51,9 @@
           "source": "//nas.example.com/share/team",
           "fstype": "cifs"
         }
+      ],
+      "expected_containers": [
+        "model-api"
       ]
     },
     {

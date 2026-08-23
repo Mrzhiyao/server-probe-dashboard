@@ -6,14 +6,18 @@ executed on the target machine through stdin.
 """
 
 import csv
+import ipaddress
 import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
@@ -738,6 +742,470 @@ def process_details_for_pid(pid):
     }
 
 
+def run_result(command, timeout=5):
+    try:
+        environment = dict(os.environ)
+        environment["LC_ALL"] = "C"
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=timeout,
+            env=environment,
+        )
+        return {
+            "returncode": completed.returncode,
+            "stdout": completed.stdout or "",
+            "stderr": completed.stderr or "",
+        }
+    except subprocess.TimeoutExpired:
+        return {"returncode": 124, "stdout": "", "stderr": "timeout"}
+    except Exception as exc:
+        return {"returncode": 1, "stdout": "", "stderr": str(exc)}
+
+
+def json_lines(text):
+    rows = []
+    for line in (text or "").splitlines():
+        try:
+            value = json.loads(line)
+            if isinstance(value, dict):
+                rows.append(value)
+        except Exception:
+            continue
+    return rows
+
+
+def size_bytes(value):
+    text = str(value or "").strip().split("(", 1)[0].strip().replace(",", "")
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgtpe]?i?b)?", text, re.I)
+    if not match:
+        return None
+    number = float(match.group(1))
+    unit = (match.group(2) or "b").lower()
+    binary = "i" in unit
+    prefix = unit[0] if len(unit) > 1 else ""
+    powers = {"": 0, "k": 1, "m": 2, "g": 3, "t": 4, "p": 5, "e": 6}
+    return int(number * ((1024 if binary else 1000) ** powers.get(prefix, 0)))
+
+
+def io_pair(value):
+    parts = [item.strip() for item in str(value or "").split("/", 1)]
+    if len(parts) != 2:
+        return None, None
+    return size_bytes(parts[0]), size_bytes(parts[1])
+
+
+def percent_value(value):
+    return numeric(str(value or "").replace("%", ""))
+
+
+def docker_inspect(ids):
+    if not ids:
+        return {}
+    template = (
+        '{"id":{{json .Id}},"image_id":{{json .Image}},"state":{{json .State}},'
+        '"restart_count":{{json .RestartCount}},"network_mode":{{json .HostConfig.NetworkMode}},'
+        '"ports":{{json .NetworkSettings.Ports}},"networks":{{json .NetworkSettings.Networks}},'
+        '"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}}}'
+    )
+    result = run_result(["docker", "inspect", "--format", template] + ids[:200], timeout=8)
+    return {item.get("id"): item for item in json_lines(result.get("stdout")) if item.get("id")}
+
+
+def docker_image_metadata(image_ids):
+    if not image_ids:
+        return {}
+    template = (
+        '{"id":{{json .Id}},"repo_tags":{{json .RepoTags}},"size":{{json .Size}},'
+        '"created":{{json .Created}},"architecture":{{json .Architecture}},'
+        '"env":{{json .Config.Env}},"labels":{{json .Config.Labels}}}'
+    )
+    result = run_result(["docker", "image", "inspect", "--format", template] + list(image_ids)[:100], timeout=8)
+    metadata = {}
+    for item in json_lines(result.get("stdout")):
+        image_id = item.get("id")
+        if not image_id:
+            continue
+        labels = item.get("labels") or {}
+        environment = {}
+        for entry in item.get("env") or []:
+            if "=" in entry:
+                key, value = entry.split("=", 1)
+                if key in ("VLLM_VERSION", "NVIDIA_VLLM_VERSION", "CUDA_VERSION"):
+                    environment[key] = value
+        version = labels.get("com.nvidia.vllm.version") or environment.get("VLLM_VERSION")
+        if not version:
+            for tag in item.get("repo_tags") or []:
+                tag_value = tag.rsplit(":", 1)[-1]
+                if re.match(r"^v?\d+\.\d+", tag_value):
+                    version = tag_value
+                    break
+        metadata[image_id] = {
+            "version": version,
+            "nvidia_release": environment.get("NVIDIA_VLLM_VERSION"),
+            "cuda_version": environment.get("CUDA_VERSION"),
+            "architecture": item.get("architecture"),
+            "created_at": item.get("created"),
+            "size_bytes": item.get("size"),
+        }
+    return metadata
+
+
+def command_tokens(command):
+    text = str(command or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1]
+    try:
+        return shlex.split(text)
+    except Exception:
+        return text.split()
+
+
+def command_option(tokens, name, multiple=False):
+    values = []
+    for index, token in enumerate(tokens):
+        if token.startswith(name + "="):
+            values.append(token.split("=", 1)[1])
+            continue
+        if token != name:
+            continue
+        cursor = index + 1
+        while cursor < len(tokens) and not tokens[cursor].startswith("--"):
+            values.append(tokens[cursor])
+            cursor += 1
+            if not multiple:
+                break
+    if multiple:
+        return values
+    return values[0] if values else None
+
+
+def vllm_details(image, command):
+    image_lower = str(image or "").lower()
+    command_lower = str(command or "").lower()
+    if "vllm" not in image_lower and "vllm" not in command_lower:
+        return None
+    tokens = command_tokens(command)
+    model_path = command_option(tokens, "--model")
+    if not model_path:
+        for index, token in enumerate(tokens[:-1]):
+            if token == "serve" and not tokens[index + 1].startswith("-"):
+                model_path = tokens[index + 1]
+                break
+    served_names = command_option(tokens, "--served-model-name", multiple=True)
+    is_service = bool(
+        model_path
+        or served_names
+        or "vllm serve" in command_lower
+        or "vllm.entrypoints" in command_lower
+        or any(token == "serve" for token in tokens)
+    )
+    if not is_service:
+        return {"service": False}
+    model_name = served_names[0] if served_names else None
+    if not model_name and model_path:
+        model_name = model_path.rstrip("/").rsplit("/", 1)[-1]
+    details = {
+        "service": True,
+        "model": model_name or model_path,
+        "served_model_names": served_names,
+        "port": int(numeric(command_option(tokens, "--port")) or 8000),
+    }
+    safe_options = {
+        "tensor_parallel_size": "--tensor-parallel-size",
+        "pipeline_parallel_size": "--pipeline-parallel-size",
+        "max_model_len": "--max-model-len",
+        "max_num_seqs": "--max-num-seqs",
+        "gpu_memory_utilization": "--gpu-memory-utilization",
+        "dtype": "--dtype",
+        "quantization": "--quantization",
+        "task": "--task",
+    }
+    for key, option in safe_options.items():
+        value = command_option(tokens, option)
+        if value is not None:
+            details[key] = value
+    return details
+
+
+def container_ports(inspect, fallback=""):
+    rows = []
+    for container_port, bindings in (inspect.get("ports") or {}).items():
+        if not bindings:
+            rows.append(container_port)
+            continue
+        for binding in bindings:
+            host = binding.get("HostIp") or "0.0.0.0"
+            port = binding.get("HostPort")
+            if port:
+                rows.append("%s:%s->%s" % (host, port, container_port))
+    if not rows and fallback:
+        rows = [item.strip() for item in str(fallback).split(",") if item.strip()]
+    return rows[:20]
+
+
+def safe_probe_host(value):
+    try:
+        address = ipaddress.ip_address(value)
+        return address.is_loopback or address.is_private or address.is_link_local
+    except Exception:
+        return value in ("localhost",)
+
+
+def endpoint_candidates(container):
+    details = container.get("vllm") or {}
+    port = int(details.get("port") or 8000)
+    inspect = container.get("_inspect") or {}
+    candidates = []
+    bindings = (inspect.get("ports") or {}).get("%s/tcp" % port) or []
+    for binding in bindings:
+        host_port = numeric(binding.get("HostPort"))
+        if host_port:
+            candidates.append(("127.0.0.1", int(host_port)))
+    if inspect.get("network_mode") == "host":
+        candidates.append(("127.0.0.1", port))
+    for network in (inspect.get("networks") or {}).values():
+        address = str((network or {}).get("IPAddress") or "")
+        if address and safe_probe_host(address):
+            candidates.append((address, port))
+    unique = []
+    for item in candidates:
+        if item not in unique:
+            unique.append(item)
+    return unique[:4]
+
+
+def local_http_request(url, timeout=2.0):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    request = urllib.request.Request(url, headers={"User-Agent": "server-probe-dashboard"})
+    started = time.monotonic()
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            payload = response.read(1024 * 1024)
+            return response.status, payload, round((time.monotonic() - started) * 1000.0, 1)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(1024 * 1024), round((time.monotonic() - started) * 1000.0, 1)
+    except Exception:
+        return None, b"", round((time.monotonic() - started) * 1000.0, 1)
+
+
+def probe_vllm(container):
+    candidates = endpoint_candidates(container)
+    if not candidates:
+        return {"status": "not_exposed", "models": []}
+    last_latency = None
+    for host, port in candidates:
+        base = "http://%s:%s" % (host, port)
+        health_code, _, health_latency = local_http_request(base + "/health")
+        last_latency = health_latency
+        models_code, payload, models_latency = local_http_request(base + "/v1/models")
+        last_latency = models_latency if models_code is not None else health_latency
+        reachable = health_code is not None or models_code is not None
+        healthy = (health_code is not None and 200 <= health_code < 300) or (
+            models_code is not None and (200 <= models_code < 300 or models_code in (401, 403))
+        )
+        if not reachable:
+            continue
+        models = []
+        if models_code is not None and 200 <= models_code < 300:
+            try:
+                data = json.loads(payload.decode("utf-8", "replace"))
+                models = [str(item.get("id")) for item in data.get("data", []) if item.get("id")][:20]
+            except Exception:
+                pass
+        return {
+            "status": "healthy" if healthy else "unhealthy",
+            "endpoint": "%s:%s" % (host, port),
+            "latency_ms": last_latency,
+            "health_code": health_code,
+            "models_code": models_code,
+            "models": models,
+        }
+    return {"status": "unhealthy", "latency_ms": last_latency, "models": []}
+
+
+def container_id_for_pid(pid, container_ids):
+    cgroup = read_first("/proc/%s/cgroup" % pid)
+    candidates = re.findall(r"[0-9a-f]{12,64}", cgroup.lower())
+    for value in candidates:
+        for container_id in container_ids:
+            if container_id.startswith(value) or value.startswith(container_id):
+                return container_id
+    return None
+
+
+def attach_gpu_containers(gpu, containers):
+    by_id = {item.get("_full_id"): item for item in containers if item.get("_full_id")}
+    if not by_id:
+        return
+    for process in (gpu or {}).get("processes") or []:
+        container_id = container_id_for_pid(process.get("pid"), by_id.keys())
+        if not container_id:
+            continue
+        container = by_id[container_id]
+        process["container_id"] = container_id[:12]
+        process["container_name"] = container.get("name")
+        container.setdefault("gpu_indices", [])
+        gpu_index = process.get("gpu_index")
+        if gpu_index not in (None, "") and str(gpu_index) not in container["gpu_indices"]:
+            container["gpu_indices"].append(str(gpu_index))
+        container["gpu_process_count"] = int(container.get("gpu_process_count") or 0) + 1
+        container["gpu_memory_used_bytes"] = int(container.get("gpu_memory_used_bytes") or 0) + int(
+            process.get("used_memory_bytes") or 0
+        )
+
+
+def docker_info():
+    if not shutil.which("docker"):
+        return {"available": False, "accessible": False, "reason": "not_installed", "containers": [], "images": []}
+
+    commands = {
+        "containers": ["docker", "ps", "-a", "--no-trunc", "--format", "{{json .}}"],
+        "stats": ["docker", "stats", "--no-stream", "--format", "{{json .}}"],
+        "images": ["docker", "image", "ls", "-a", "--no-trunc", "--format", "{{json .}}"],
+        "disk": ["docker", "system", "df", "--format", "{{json .}}"],
+        "version": ["docker", "version", "--format", "{{.Server.Version}}"],
+    }
+    timeouts = {"containers": 6, "stats": 6, "images": 6, "disk": 6, "version": 4}
+    with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+        futures = {key: executor.submit(run_result, command, timeouts[key]) for key, command in commands.items()}
+        results = {key: future.result() for key, future in futures.items()}
+
+    container_result = results["containers"]
+    if container_result.get("returncode") != 0:
+        error = (container_result.get("stderr") or "").lower()
+        reason = "permission_denied" if "permission denied" in error else "daemon_unavailable"
+        return {"available": True, "accessible": False, "reason": reason, "containers": [], "images": []}
+
+    ps_rows = json_lines(container_result.get("stdout"))
+    ids = [row.get("ID") for row in ps_rows if row.get("ID")]
+    inspect_rows = docker_inspect(ids)
+    inspect_by_prefix = {key[:12]: value for key, value in inspect_rows.items()}
+    stats_rows = json_lines(results["stats"].get("stdout"))
+    stats_by_name = {row.get("Name"): row for row in stats_rows if row.get("Name")}
+    stats_by_id = {str(row.get("ID") or row.get("Container") or "")[:12]: row for row in stats_rows}
+
+    containers = []
+    vllm_image_ids = set()
+    for row in ps_rows:
+        full_id = str(row.get("ID") or "")
+        inspect = inspect_rows.get(full_id) or inspect_by_prefix.get(full_id[:12]) or {}
+        state = inspect.get("state") or {}
+        stats = stats_by_name.get(row.get("Names")) or stats_by_id.get(full_id[:12]) or {}
+        memory_used, memory_limit = io_pair(stats.get("MemUsage"))
+        network_rx, network_tx = io_pair(stats.get("NetIO"))
+        block_read, block_write = io_pair(stats.get("BlockIO"))
+        image = row.get("Image") or ""
+        inspect_command = " ".join([str(value) for value in (inspect.get("entrypoint") or []) + (inspect.get("cmd") or [])])
+        command = inspect_command or row.get("Command") or ""
+        vllm = vllm_details(image, command)
+        image_id = inspect.get("image_id")
+        if vllm and image_id:
+            vllm_image_ids.add(image_id)
+        health = ((state.get("Health") or {}).get("Status"))
+        current_state = state.get("Status") or row.get("State") or "unknown"
+        container = {
+            "id": full_id[:12],
+            "_full_id": full_id,
+            "name": row.get("Names") or full_id[:12],
+            "image": image,
+            "image_id": str(image_id or "")[:19],
+            "state": current_state,
+            "status": row.get("Status"),
+            "health": health,
+            "running": current_state == "running",
+            "started_at": state.get("StartedAt"),
+            "finished_at": state.get("FinishedAt"),
+            "restart_count": int(inspect.get("restart_count") or 0),
+            "cpu_percent": percent_value(stats.get("CPUPerc")),
+            "memory_used_bytes": memory_used,
+            "memory_limit_bytes": memory_limit,
+            "memory_percent": percent_value(stats.get("MemPerc")),
+            "network_rx_bytes": network_rx,
+            "network_tx_bytes": network_tx,
+            "block_read_bytes": block_read,
+            "block_write_bytes": block_write,
+            "pids": int(numeric(stats.get("PIDs")) or 0),
+            "ports": container_ports(inspect, row.get("Ports")),
+            "_inspect": inspect,
+        }
+        if vllm:
+            container["vllm"] = vllm
+        containers.append(container)
+
+    image_metadata = docker_image_metadata(vllm_image_ids)
+    vllm_image_containers = [item for item in containers if item.get("vllm")]
+    for container in vllm_image_containers:
+        metadata = image_metadata.get((container.get("_inspect") or {}).get("image_id")) or {}
+        container["vllm"].update({key: value for key, value in metadata.items() if value not in (None, "")})
+    vllm_containers = [item for item in vllm_image_containers if (item.get("vllm") or {}).get("service")]
+    running_vllm = [item for item in vllm_containers if item.get("running")]
+    if running_vllm:
+        with ThreadPoolExecutor(max_workers=min(6, len(running_vllm))) as executor:
+            probes = list(executor.map(probe_vllm, running_vllm))
+        for container, probe in zip(running_vllm, probes):
+            container["vllm"]["probe"] = probe
+
+    images = []
+    for row in json_lines(results["images"].get("stdout")):
+        repository = row.get("Repository") or "<none>"
+        tag = row.get("Tag") or "<none>"
+        image_id = str(row.get("ID") or "")
+        images.append(
+            {
+                "repository": repository,
+                "tag": tag,
+                "id": image_id[:19],
+                "size_bytes": size_bytes(row.get("Size")),
+                "created_at": row.get("CreatedAt"),
+                "vllm": "vllm" in (repository + ":" + tag).lower(),
+            }
+        )
+    images.sort(key=lambda item: item.get("size_bytes") or 0, reverse=True)
+
+    disk_usage = {}
+    for row in json_lines(results["disk"].get("stdout")):
+        kind = str(row.get("Type") or "").lower()
+        if not kind:
+            continue
+        disk_usage[kind] = {
+            "total": int(numeric(row.get("TotalCount")) or 0),
+            "active": int(numeric(row.get("Active")) or 0),
+            "size_bytes": size_bytes(row.get("Size")),
+            "reclaimable_bytes": size_bytes(row.get("Reclaimable")),
+        }
+
+    for container in containers:
+        container.pop("_inspect", None)
+    summary = {
+        "container_count": len(containers),
+        "running_count": sum(1 for item in containers if item.get("running")),
+        "stopped_count": sum(1 for item in containers if not item.get("running")),
+        "unhealthy_count": sum(1 for item in containers if item.get("running") and item.get("health") == "unhealthy"),
+        "restarting_count": sum(1 for item in containers if item.get("state") == "restarting"),
+        "vllm_count": len(vllm_containers),
+        "vllm_image_container_count": len(vllm_image_containers),
+        "vllm_running_count": sum(1 for item in vllm_containers if item.get("running")),
+        "vllm_unhealthy_count": sum(
+            1
+            for item in vllm_containers
+            if item.get("running") and ((item.get("vllm") or {}).get("probe") or {}).get("status") == "unhealthy"
+        ),
+        "image_count": len(images),
+    }
+    return {
+        "available": True,
+        "accessible": True,
+        "version": results["version"].get("stdout", "").strip() or None,
+        "summary": summary,
+        "containers": containers[:200],
+        "images": images[:100],
+        "disk_usage": disk_usage,
+    }
+
+
 def memory_mib_to_bytes(value):
     amount = numeric(value)
     if amount is None:
@@ -1094,19 +1562,28 @@ def collect():
     disk_before = diskstats_snapshot()
     io_started = time.monotonic()
     load1, load5, load15 = load_average()
-    cpu = {
-        "percent": cpu_percent(),
-        "cores": os.cpu_count(),
-        "load1": load1,
-        "load5": load5,
-        "load15": load15,
-    }
-    memory = memory_info()
-    gpu = gpu_info()
-    processes = {
-        "top_cpu": process_rows("-pcpu", 10),
-        "top_mem": process_rows("-pmem", 10),
-    }
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        gpu_future = executor.submit(gpu_info)
+        docker_future = executor.submit(docker_info)
+        top_cpu_future = executor.submit(process_rows, "-pcpu", 10)
+        top_mem_future = executor.submit(process_rows, "-pmem", 10)
+        cpu = {
+            "percent": cpu_percent(),
+            "cores": os.cpu_count(),
+            "load1": load1,
+            "load5": load5,
+            "load15": load15,
+        }
+        memory = memory_info()
+        gpu = gpu_future.result()
+        docker = docker_future.result()
+        processes = {
+            "top_cpu": top_cpu_future.result(),
+            "top_mem": top_mem_future.result(),
+        }
+    attach_gpu_containers(gpu, docker.get("containers") or [])
+    for container in docker.get("containers") or []:
+        container.pop("_full_id", None)
     disk_after = diskstats_snapshot()
     storage = storage_info(disk_before, disk_after, max(time.monotonic() - io_started, 0.001))
     return {
@@ -1122,6 +1599,7 @@ def collect():
         "memory": memory,
         "disk": disk_info(storage),
         "storage": storage,
+        "docker": docker,
         "gpu": gpu,
         "processes": processes,
     }

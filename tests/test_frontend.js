@@ -31,6 +31,35 @@ const result = {
   status: "online",
   alerts: [],
   metrics: {
+    docker: {
+      available: true,
+      accessible: true,
+      version: "29.4.1",
+      summary: { container_count: 1, running_count: 1, unhealthy_count: 0, vllm_running_count: 1, image_count: 1 },
+      disk_usage: { images: { size_bytes: 20000000000, reclaimable_bytes: 1000000000 } },
+      images: [{ repository: "vllm/vllm-openai", tag: "latest", size_bytes: 20000000000, vllm: true }],
+      containers: [
+        {
+          id: "abcdef123456",
+          name: "model-api",
+          image: "vllm/vllm-openai:latest",
+          state: "running",
+          running: true,
+          cpu_percent: 12,
+          memory_percent: 25,
+          memory_used_bytes: 4000000000,
+          ports: ["0.0.0.0:18223->18223/tcp"],
+          gpu_indices: ["0"],
+          gpu_memory_used_bytes: 8000000000,
+          vllm: {
+            service: true,
+            model: "Qwen3-VL-8B-Instruct",
+            version: "0.19.0",
+            probe: { status: "healthy", endpoint: "127.0.0.1:18223", latency_ms: 3 },
+          },
+        },
+      ],
+    },
     storage: {
       smartctl_available: true,
       summary: { mount_count: 2, mounted_count: 2, mount_issue_count: 0, device_count: 1, smart_issue_count: 0 },
@@ -82,6 +111,12 @@ assert.match(html, /very-long-share-name/);
 assert.match(html, /Example NVMe/);
 assert.match(html, /存储正常/);
 
+const containerHtml = vm.runInContext("renderContainerHost(__result)", context);
+assert.match(containerHtml, /model-api/);
+assert.match(containerHtml, /Qwen3-VL-8B-Instruct/);
+assert.match(containerHtml, /接口正常/);
+assert.match(containerHtml, /Docker 29\.4\.1/);
+
 context.__alert = {
   kind: "mount",
   path: "/nas",
@@ -89,6 +124,9 @@ context.__alert = {
 };
 const alertText = vm.runInContext("alertText(__alert)", context);
 assert.equal(alertText, "/nas · 只有自动挂载占位，真实文件系统未挂载");
+
+context.__containerAlert = { kind: "vllm", container: "model-api", model: "Qwen", message: "ignored" };
+assert.equal(vm.runInContext("alertText(__containerAlert)", context), "model-api · Qwen 接口不可用");
 
 context.__persistentHistory = {
   "edge-24": [
@@ -102,4 +140,4 @@ const historyCpu = vm.runInContext(
 );
 assert.deepEqual(Array.from(historyCpu), [10, 20]);
 
-console.log("frontend storage and history rendering checks passed");
+console.log("frontend storage, history, and container rendering checks passed");

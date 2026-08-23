@@ -440,6 +440,31 @@ class Monitor:
         )
         summary["network_mount_count"] = sum(1 for item in mounts if item.get("kind") == "network")
 
+    def apply_container_expectations(self, server, metrics):
+        configured = [str(value).strip() for value in (server.get("expected_containers") or []) if str(value).strip()]
+        if not configured or not metrics:
+            return
+        docker = metrics.setdefault("docker", {"available": False, "accessible": False, "containers": [], "images": []})
+        containers = docker.setdefault("containers", [])
+        by_name = {item.get("name"): item for item in containers if item.get("name")}
+        for name in configured:
+            current = by_name.get(name)
+            if current is None:
+                current = {
+                    "name": name,
+                    "state": "missing",
+                    "status": "expected container is missing",
+                    "running": False,
+                }
+                containers.append(current)
+                by_name[name] = current
+            current["expected"] = True
+        summary = docker.setdefault("summary", {})
+        summary["expected_count"] = len(configured)
+        summary["expected_issue_count"] = sum(
+            1 for item in containers if item.get("expected") and not item.get("running")
+        )
+
     def request_machines(self):
         return [request_machine(server) for server in self.servers]
 
@@ -750,6 +775,63 @@ class Monitor:
                     message=", ".join(smart.get("messages") or []) or "disk health warning",
                 )
             )
+
+        docker = metrics.get("docker") or {}
+        for container in docker.get("containers") or []:
+            name = container.get("name") or container.get("id") or "container"
+            state = container.get("state")
+            if container.get("expected") and not container.get("running"):
+                alerts.append(
+                    self.alert_item(
+                        result,
+                        "critical",
+                        "container_expected",
+                        "Container",
+                        container=name,
+                        message="expected container is not running",
+                    )
+                )
+                continue
+            if state == "restarting":
+                alerts.append(
+                    self.alert_item(
+                        result,
+                        "critical",
+                        "container_restarting",
+                        "Container",
+                        container=name,
+                        message="container is restarting",
+                    )
+                )
+                continue
+            vllm = container.get("vllm") or {}
+            probe = vllm.get("probe") or {}
+            vllm_unhealthy = bool(
+                container.get("running") and vllm.get("service") and probe.get("status") == "unhealthy"
+            )
+            if vllm_unhealthy:
+                alerts.append(
+                    self.alert_item(
+                        result,
+                        "critical",
+                        "vllm",
+                        "vLLM",
+                        container=name,
+                        model=vllm.get("model"),
+                        message="container is running but the vLLM endpoint is unavailable",
+                    )
+                )
+            elif container.get("running") and container.get("health") == "unhealthy":
+                alerts.append(
+                    self.alert_item(
+                        result,
+                        "warning",
+                        "container_health",
+                        "Container",
+                        container=name,
+                        message="Docker health check is unhealthy",
+                    )
+                )
         return alerts
 
     def record_history(self, snapshot):
@@ -948,6 +1030,7 @@ class Monitor:
             else:
                 metrics = self.collect_ssh(server)
             self.apply_storage_expectations(server, metrics)
+            self.apply_container_expectations(server, metrics)
             latency_ms = int((time.time() - started) * 1000)
             result = {
                 **public_server(server),

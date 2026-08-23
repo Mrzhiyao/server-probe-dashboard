@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Server Probe Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260823-history" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260823-containers" />
   </head>
   <body>
     <div class="app-shell">
@@ -26,6 +26,7 @@
       <nav class="view-tabs" aria-label="监控视图">
         <button class="active" type="button" data-view="monitor" aria-pressed="true">设备监控</button>
         <button type="button" data-view="storage" aria-pressed="false">存储与 NAS</button>
+        <button type="button" data-view="containers" aria-pressed="false">容器与模型</button>
       </nav>
 
       <section class="toolbar" aria-label="筛选">
@@ -47,6 +48,7 @@
             <option value="mem">内存</option>
             <option value="gpu">GPU</option>
             <option value="storage">存储占用</option>
+            <option value="containers">容器异常</option>
             <option value="status">状态</option>
           </select>
         </div>
@@ -85,6 +87,15 @@
             <div class="warn"><span id="storageSmartIssueCount">0</span><small>SMART 告警</small></div>
           </div>
           <section id="storageGrid" class="storage-grid" aria-live="polite"></section>
+        </section>
+        <section id="containerView" hidden>
+          <div class="container-overview" aria-live="polite">
+            <div><span id="dockerHostCount">0</span><small>Docker 主机</small></div>
+            <div><span id="runningContainerCount">0</span><small>运行容器</small></div>
+            <div class="warn"><span id="containerIssueCount">0</span><small>容器异常</small></div>
+            <div><span id="runningVllmCount">0</span><small>vLLM 在线</small></div>
+          </div>
+          <section id="containerGrid" class="container-grid" aria-live="polite"></section>
         </section>
       </main>
     </div>
@@ -131,6 +142,6 @@
       </article>
     </template>
 
-    <script src="/static/app.js?v=20260823-history"></script>
+    <script src="/static/app.js?v=20260823-containers"></script>
   </body>
 </html>
