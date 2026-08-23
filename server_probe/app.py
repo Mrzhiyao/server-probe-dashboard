@@ -2211,6 +2211,7 @@ def main(argv=None):
     DashboardHandler.auth_enabled = auth_enabled
     DashboardHandler.cookie_secure = env_bool("PROBE_AUTH_COOKIE_SECURE", bool(auth_config.get("cookie_secure", False)))
     dsn = os.getenv("PROBE_AUTH_DB_DSN") or auth_config.get("postgres_dsn")
+    auth_store = None
     if auth_enabled:
         if not dsn:
             raise RuntimeError("PROBE_AUTH_DB_DSN is required when authentication is enabled")
@@ -2308,7 +2309,11 @@ def main(argv=None):
             ),
             excluded_users=excluded_users,
             max_users=configured_number("PROBE_USAGE_REPORT_MAX_USERS", usage_report_config, "max_users", 80),
+            detail_users=configured_number(
+                "PROBE_USAGE_REPORT_DETAIL_USERS", usage_report_config, "detail_users", 12
+            ),
             dashboard_url=os.getenv("PROBE_PUBLIC_URL") or usage_report_config.get("dashboard_url"),
+            identity_provider=auth_store.resource_identity_map if auth_store else None,
             send_on_start=env_bool(
                 "PROBE_USAGE_REPORT_SEND_ON_START",
                 value_bool(usage_report_config.get("send_on_start"), False),

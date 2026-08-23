@@ -2,7 +2,8 @@ import unittest
 from unittest import mock
 
 from server_probe import collector
-from server_probe.usage_reports import HourlyUsageReporter, current_user_usage
+from server_probe.auth import contains_cjk
+from server_probe.usage_reports import HourlyUsageReporter, current_user_usage, usage_bar
 
 
 GIB = 1024 * 1024 * 1024
@@ -53,6 +54,7 @@ class HourlyUsageReporterTests(unittest.TestCase):
                     "group": "GPU",
                     "status": "online",
                     "metrics": {
+                        "memory": {"total_bytes": 16 * GIB},
                         "user_resources": [
                             {
                                 "user": "alice",
@@ -69,8 +71,17 @@ class HourlyUsageReporterTests(unittest.TestCase):
                                 "rss_bytes": 8 * GIB,
                                 "process_count": 8,
                             },
+                            {
+                                "user": "charlie",
+                                "uid": 1002,
+                                "cpu_percent_sum": 5,
+                                "rss_bytes": 2 * GIB,
+                                "process_count": 3,
+                                "running_process_count": 0,
+                            },
                         ],
                         "gpu": {
+                            "devices": [{"index": "0", "memory_total_bytes": 8 * GIB}],
                             "user_summary": [
                                 {
                                     "user": "alice",
@@ -118,31 +129,49 @@ class HourlyUsageReporterTests(unittest.TestCase):
         machines = current_user_usage(self.snapshot(), ["root", "nobody"])
         self.assertEqual(len(machines), 1)
         rows = {row["user"]: row for row in machines[0]["users"]}
-        self.assertEqual(set(rows), {"alice", "bob"})
+        self.assertEqual(set(rows), {"alice", "bob", "charlie"})
         self.assertEqual(rows["alice"]["memory_bytes"], 1 * GIB)
         self.assertEqual(rows["alice"]["gpu_memory_bytes"], 2 * GIB)
         self.assertEqual(rows["alice"]["container_count"], 1)
         self.assertEqual(rows["bob"]["memory_bytes"], 3 * GIB)
         self.assertEqual(rows["bob"]["gpu_memory_bytes"], 4 * GIB)
         self.assertEqual(rows["bob"]["gpu_indices"], ["1"])
+        self.assertEqual(machines[0]["memory_total_bytes"], 16 * GIB)
+        self.assertEqual(machines[0]["gpu_memory_total_bytes"], 8 * GIB)
 
     def test_report_is_sent_on_the_next_hour_boundary(self):
         now = 1000.0
         client = RecordingClient()
-        reporter = HourlyUsageReporter(client, interval_seconds=3600, now_fn=lambda: now)
+        reporter = HourlyUsageReporter(
+            client,
+            interval_seconds=3600,
+            identity_provider=lambda: {"alice": "Alice Chen", "bob": "Bob Li", "charlie": "Charlie Wu"},
+            now_fn=lambda: now,
+        )
         self.assertFalse(reporter.process(self.snapshot()))
         self.assertEqual(client.payloads, [])
         now = 3600.0
         self.assertTrue(reporter.process(self.snapshot()))
         self.assertEqual(len(client.payloads), 1)
         payload = client.payloads[0]
-        self.assertEqual(payload["card"]["header"]["title"]["content"], "每小时用户资源报告")
+        self.assertEqual(payload["card"]["header"]["title"]["content"], "每小时用户资源概览")
         rendered = str(payload)
         self.assertIn("alice", rendered)
         self.assertIn("bob", rendered)
+        self.assertIn("Alice Chen", rendered)
+        self.assertIn("Bob Li", rendered)
+        self.assertIn("Charlie Wu", rendered)
+        self.assertIn("内存重点占用", rendered)
+        self.assertIn("column_set", rendered)
+        self.assertIn("<font color=", rendered)
         self.assertNotIn("`root`", rendered)
         self.assertEqual(reporter.status()["sent_reports"], 1)
         self.assertEqual(reporter.status()["snapshot_samples"], 0)
+
+    def test_visual_bar_and_name_helpers(self):
+        self.assertIn("80%", usage_bar(8, 10))
+        self.assertTrue(contains_cjk("周大智"))
+        self.assertFalse(contains_cjk("student_t"))
 
 
 if __name__ == "__main__":

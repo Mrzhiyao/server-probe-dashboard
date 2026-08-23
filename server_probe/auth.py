@@ -23,6 +23,10 @@ def normalized_key(value):
     return "".join(ch.lower() for ch in str(value or "") if ch.isalnum())
 
 
+def contains_cjk(value):
+    return any("\u4e00" <= char <= "\u9fff" for char in str(value or ""))
+
+
 def password_hash(password, iterations=DEFAULT_ITERATIONS):
     salt = secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
@@ -218,6 +222,43 @@ class AuthStore:
                     """
                 )
                 return [self.user_dict(row) for row in cur.fetchall()]
+
+    def resource_identity_map(self):
+        account_names = {}
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT username, display_name
+                    FROM probe_machine_accounts
+                    WHERE display_name IS NOT NULL AND btrim(display_name) <> ''
+                    """
+                )
+                for username, display_name in cur.fetchall():
+                    key = str(username or "").strip().lower()
+                    name = str(display_name or "").strip()
+                    if key and name:
+                        account_names.setdefault(key, set()).add(name)
+                cur.execute(
+                    """
+                    SELECT username, display_name
+                    FROM probe_users
+                    WHERE is_active = TRUE AND display_name IS NOT NULL AND btrim(display_name) <> ''
+                    """
+                )
+                current_users = cur.fetchall()
+
+        identities = {
+            username: next(iter(names))
+            for username, names in account_names.items()
+            if len(names) == 1
+        }
+        for username, display_name in current_users:
+            key = str(username or "").strip().lower()
+            name = str(display_name or "").strip()
+            if key and name and (contains_cjk(name) or key not in identities):
+                identities[key] = name
+        return identities
 
     def get_user_by_username(self, username):
         username = str(username or "").strip()
