@@ -1034,15 +1034,31 @@ function renderVllmInfo(container) {
   </div>`;
 }
 
+function containerOwnerText(container) {
+  const sources = {
+    label: "显式标签",
+    compose: "Compose 路径推断",
+    home_mount: "主机目录推断",
+    unknown: "未记录创建者",
+  };
+  return {
+    user: container.owner_user || "未知",
+    source: sources[container.owner_source] || "未记录创建者",
+    runtime: container.runtime_user || "root",
+  };
+}
+
 function renderContainerRow(container) {
   const status = containerState(container);
   const gpuText = container.gpu_indices?.length
     ? `GPU ${container.gpu_indices.join(",")} · ${fmtBytes(container.gpu_memory_used_bytes)}`
     : "未关联 GPU 进程";
   const ports = container.ports?.length ? container.ports.join(" · ") : "-";
+  const owner = containerOwnerText(container);
   return `<div class="container-row" role="row">
     <div class="container-cell container-name-cell" role="cell"><strong>${escapeHtml(container.name || container.id || "-")}</strong><span>${escapeHtml(container.id || "")}</span></div>
     <div class="container-cell container-image-cell" role="cell" title="${escapeHtml(container.image || "")}">${escapeHtml(container.image || "-")}</div>
+    <div class="container-cell container-owner-cell" role="cell"><strong>${escapeHtml(owner.user)}</strong><span>${escapeHtml(owner.source)}</span><small>容器内 ${escapeHtml(owner.runtime)}</small></div>
     <div class="container-cell" role="cell"><span class="container-state ${status.className}">${status.label}</span><small>${escapeHtml(containerAge(container))}</small></div>
     <div class="container-cell resource-cell" role="cell"><span>CPU ${fmtPercent(container.cpu_percent)}</span><span>内存 ${fmtPercent(container.memory_percent)} · ${fmtBytes(container.memory_used_bytes)}</span></div>
     <div class="container-cell gpu-container-cell" role="cell">${escapeHtml(gpuText)}</div>
@@ -1055,7 +1071,7 @@ function renderContainerRow(container) {
 function renderContainerTable(containers, label) {
   if (!containers.length) return `<div class="container-inline-empty">${escapeHtml(label || "暂无容器")}</div>`;
   return `<div class="container-table" role="table">
-    <div class="container-table-head" role="row"><span>容器</span><span>镜像</span><span>状态</span><span>资源</span><span>GPU</span><span>网络 / I/O</span><span>端口</span><span>vLLM 服务</span></div>
+    <div class="container-table-head" role="row"><span>容器</span><span>镜像</span><span>归属用户</span><span>状态</span><span>资源</span><span>GPU</span><span>网络 / I/O</span><span>端口</span><span>vLLM 服务</span></div>
     ${containers.map(renderContainerRow).join("")}
   </div>`;
 }

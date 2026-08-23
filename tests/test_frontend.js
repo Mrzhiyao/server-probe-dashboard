@@ -43,6 +43,10 @@ const result = {
           id: "abcdef123456",
           name: "model-api",
           image: "vllm/vllm-openai:latest",
+          owner_user: "alice",
+          owner_source: "label",
+          owner_confidence: "exact",
+          runtime_user: "root",
           state: "running",
           running: true,
           cpu_percent: 12,
@@ -114,6 +118,8 @@ assert.match(html, /存储正常/);
 const containerHtml = vm.runInContext("renderContainerHost(__result)", context);
 assert.match(containerHtml, /model-api/);
 assert.match(containerHtml, /Qwen3-VL-8B-Instruct/);
+assert.match(containerHtml, /alice/);
+assert.match(containerHtml, /显式标签/);
 assert.match(containerHtml, /接口正常/);
 assert.match(containerHtml, /Docker 29\.4\.1/);
 

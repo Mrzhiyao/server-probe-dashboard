@@ -744,10 +744,10 @@ summary:focus-visible {
 .container-table-head,
 .container-row {
   display: grid;
-  grid-template-columns: minmax(145px, 0.9fr) minmax(185px, 1.15fr) 94px 150px 135px minmax(170px, 1fr) minmax(150px, 0.9fr) minmax(230px, 1.35fr);
+  grid-template-columns: minmax(145px, 0.9fr) minmax(185px, 1.15fr) 138px 94px 150px 135px minmax(170px, 1fr) minmax(150px, 0.9fr) minmax(230px, 1.35fr);
   gap: 12px;
   align-items: center;
-  min-width: 1280px;
+  min-width: 1420px;
 }
 
 .container-table-head {
@@ -793,6 +793,10 @@ summary:focus-visible {
 
 .container-image-cell {
   color: #d5d9dd;
+}
+
+.container-owner-cell strong {
+  color: var(--cyan);
 }
 
 .resource-cell span,

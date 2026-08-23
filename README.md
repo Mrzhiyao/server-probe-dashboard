@@ -127,6 +127,23 @@ Stopped containers are inventory only and do not alert by default. Add container
 
 Docker collection uses `docker ps`, `docker stats --no-stream`, `docker system df`, and narrowly formatted inspect output. Environment variables and complete commands are never returned to the browser. vLLM detection exposes only allowlisted model/runtime flags and probes local or private container endpoints.
 
+Docker does not retain the Linux user who originally ran `docker run`. The dashboard reports an owner only when it can use an explicit label or infer one from a Compose working directory or `/home/<user>` bind mount. Add an explicit label for exact attribution:
+
+```bash
+docker run --label server-probe.owner="$USER" ...
+```
+
+Docker Compose can use the same label:
+
+```yaml
+services:
+  model-api:
+    labels:
+      server-probe.owner: "${USER}"
+```
+
+The container-internal runtime user is displayed separately and is never treated as the creator.
+
 Local filesystem capacity and inode data are collected with short timeouts. Network mounts are never traversed for capacity checks because a stale CIFS/NFS mount can put `stat` or `df` into uninterruptible kernel I/O; their health instead uses mount metadata, CIFS kernel connection state when available, and bounded service-port probes. SMART data appears when `smartctl` is installed and the SSH collector user has permission to read the device.
 
 The optional `provision` block inherits the host, port, and jump-host settings from the server entry unless overridden.

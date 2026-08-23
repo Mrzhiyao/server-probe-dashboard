@@ -808,7 +808,8 @@ def docker_inspect(ids):
         '{"id":{{json .Id}},"image_id":{{json .Image}},"state":{{json .State}},'
         '"restart_count":{{json .RestartCount}},"network_mode":{{json .HostConfig.NetworkMode}},'
         '"ports":{{json .NetworkSettings.Ports}},"networks":{{json .NetworkSettings.Networks}},'
-        '"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}}}'
+        '"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},'
+        '"config_user":{{json .Config.User}},"labels":{{json .Config.Labels}},"mounts":{{json .Mounts}}}'
     )
     result = run_result(["docker", "inspect", "--format", template] + ids[:200], timeout=8)
     return {item.get("id"): item for item in json_lines(result.get("stdout")) if item.get("id")}
@@ -928,6 +929,59 @@ def vllm_details(image, command):
         if value is not None:
             details[key] = value
     return details
+
+
+def valid_owner_name(value):
+    text = str(value or "").strip()
+    return text if re.match(r"^[a-z_][a-z0-9_-]{0,31}$", text) else None
+
+
+def existing_owner_name(value):
+    owner = valid_owner_name(value)
+    if not owner or pwd is None:
+        return owner
+    try:
+        pwd.getpwnam(owner)
+        return owner
+    except Exception:
+        return None
+
+
+def owner_from_home_path(value):
+    path = str(value or "")
+    if path == "/root" or path.startswith("/root/"):
+        return existing_owner_name("root")
+    match = re.match(r"^/home/([^/]+)(?:/|$)", path)
+    return existing_owner_name(match.group(1)) if match else None
+
+
+def infer_container_owner(inspect):
+    labels = {str(key).lower(): value for key, value in (inspect.get("labels") or {}).items()}
+    for key in ("server-probe.owner", "com.server-probe.owner", "owner"):
+        owner = valid_owner_name(labels.get(key))
+        if owner:
+            return {"owner_user": owner, "owner_source": "label", "owner_confidence": "exact"}
+
+    working_dir = labels.get("com.docker.compose.project.working_dir")
+    owner = owner_from_home_path(working_dir)
+    if owner:
+        return {"owner_user": owner, "owner_source": "compose", "owner_confidence": "inferred"}
+
+    owners = []
+    for mount in inspect.get("mounts") or []:
+        owner = owner_from_home_path((mount or {}).get("Source"))
+        if owner and owner not in owners:
+            owners.append(owner)
+    if len(owners) == 1:
+        return {"owner_user": owners[0], "owner_source": "home_mount", "owner_confidence": "inferred"}
+
+    runtime_user = str(inspect.get("config_user") or "root").strip() or "root"
+    return {
+        "owner_user": None,
+        "owner_source": "unknown",
+        "owner_confidence": "unknown",
+        "runtime_user": runtime_user,
+    }
 
 
 def container_ports(inspect, fallback=""):
@@ -1129,8 +1183,10 @@ def docker_info():
             "block_write_bytes": block_write,
             "pids": int(numeric(stats.get("PIDs")) or 0),
             "ports": container_ports(inspect, row.get("Ports")),
+            "runtime_user": str(inspect.get("config_user") or "root").strip() or "root",
             "_inspect": inspect,
         }
+        container.update(infer_container_owner(inspect))
         if vllm:
             container["vllm"] = vllm
         containers.append(container)

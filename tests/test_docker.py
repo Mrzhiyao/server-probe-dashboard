@@ -59,6 +59,29 @@ class DockerParserTests(unittest.TestCase):
         self.assertEqual(containers[0]["gpu_indices"], ["2"])
         self.assertEqual(containers[0]["gpu_memory_used_bytes"], 4096)
 
+    def test_container_owner_prefers_explicit_label(self):
+        owner = collector.infer_container_owner(
+            {
+                "labels": {"server-probe.owner": "alice", "com.docker.compose.project.working_dir": "/home/bob/app"},
+                "mounts": [],
+            }
+        )
+        self.assertEqual(owner["owner_user"], "alice")
+        self.assertEqual(owner["owner_confidence"], "exact")
+
+    def test_container_owner_can_be_inferred_from_home_mount(self):
+        with mock.patch.object(collector, "existing_owner_name", side_effect=lambda value: value):
+            owner = collector.infer_container_owner(
+                {"labels": {}, "mounts": [{"Source": "/home/carol/models"}], "config_user": "1000"}
+            )
+        self.assertEqual(owner["owner_user"], "carol")
+        self.assertEqual(owner["owner_source"], "home_mount")
+
+    def test_unknown_creator_keeps_runtime_user_separate(self):
+        owner = collector.infer_container_owner({"labels": {}, "mounts": [], "config_user": "1001"})
+        self.assertIsNone(owner["owner_user"])
+        self.assertEqual(owner["runtime_user"], "1001")
+
 
 class DockerAlertTests(unittest.TestCase):
     def monitor(self):
