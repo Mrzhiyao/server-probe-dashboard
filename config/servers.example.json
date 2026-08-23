@@ -17,7 +17,11 @@
     "gpu_warn_percent": 92,
     "gpu_critical_percent": 98,
     "disk_warn_percent": 90,
-    "disk_critical_percent": 95
+    "disk_critical_percent": 95,
+    "inode_warn_percent": 90,
+    "inode_critical_percent": 98,
+    "mount_latency_warn_ms": 2000,
+    "mount_latency_critical_ms": 5000
   },
   "connect_timeout_seconds": 7,
   "command_timeout_seconds": 12,
@@ -36,7 +40,14 @@
       "host": "203.0.113.10",
       "port": 22,
       "user": "root",
-      "password_env": "DIRECT_SSH_PASSWORD"
+      "password_env": "DIRECT_SSH_PASSWORD",
+      "expected_mounts": [
+        {
+          "mount": "/nas",
+          "source": "//nas.example.com/share/team",
+          "fstype": "cifs"
+        }
+      ]
     },
     {
       "id": "example-jump",

@@ -6,6 +6,7 @@ A lightweight SSH-based Linux resource dashboard. The dashboard host periodicall
 
 - Multi-host dashboard cards
 - CPU, memory, GPU utilization, GPU memory, temperature, load average, disk usage, and uptime
+- Storage and NAS view with real-mount detection, inode usage, local disk I/O rates, physical disk inventory, and optional SMART health
 - Per-host history sparklines, current alerts, and per-user GPU usage summaries
 - Top CPU, memory, and GPU process tables
 - NVIDIA GPU metrics through `nvidia-smi`
@@ -78,6 +79,26 @@ Slow targets can override the global SSH command timeout in their server entry:
   }
 }
 ```
+
+Mounts listed in `/etc/fstab` are treated as expected automatically. Manually mounted filesystems can be marked as required in a server entry so a later unmount becomes an alert:
+
+```json
+{
+  "id": "storage-host",
+  "host": "example.internal",
+  "user": "root",
+  "password_env": "DIRECT_SSH_PASSWORD",
+  "expected_mounts": [
+    {
+      "mount": "/nas",
+      "source": "//nas.example.com/share/team",
+      "fstype": "cifs"
+    }
+  ]
+}
+```
+
+Local filesystem capacity and inode data are collected with short timeouts. Network mounts are never traversed for capacity checks because a stale CIFS/NFS mount can put `stat` or `df` into uninterruptible kernel I/O; their health instead uses mount metadata, CIFS kernel connection state when available, and bounded service-port probes. SMART data appears when `smartctl` is installed and the SSH collector user has permission to read the device.
 
 The optional `provision` block inherits the host, port, and jump-host settings from the server entry unless overridden.
 

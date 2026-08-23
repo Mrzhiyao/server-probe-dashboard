@@ -376,6 +376,50 @@ class Monitor:
         value = as_number(server.get(key))
         return float(value) if value is not None and value > 0 else default
 
+    def apply_storage_expectations(self, server, metrics):
+        configured = server.get("expected_mounts") or []
+        if not configured or not metrics:
+            return
+        storage = metrics.setdefault("storage", {"mounts": [], "devices": [], "summary": {}})
+        mounts = storage.setdefault("mounts", [])
+        by_path = {item.get("mount"): item for item in mounts if item.get("mount")}
+        for value in configured:
+            item = {"mount": value} if isinstance(value, str) else dict(value or {})
+            mount_path = str(item.get("mount") or "").strip()
+            if not mount_path.startswith("/"):
+                continue
+            current = by_path.get(mount_path)
+            if current is None:
+                source = str(item.get("source") or "")
+                fstype = str(item.get("fstype") or "")
+                current = {
+                    "mount": mount_path,
+                    "source": source,
+                    "fstype": fstype,
+                    "kind": "network" if fstype in ("cifs", "smb3", "nfs", "nfs4", "sshfs", "fuse.sshfs") or source.startswith("//") else "local",
+                    "status": "missing",
+                    "automount": False,
+                    "read_only": False,
+                }
+                mounts.append(current)
+                by_path[mount_path] = current
+            current["expected"] = True
+            if item.get("source") and not current.get("source"):
+                current["source"] = item["source"]
+            if item.get("fstype") and not current.get("fstype"):
+                current["fstype"] = item["fstype"]
+
+        mounts.sort(key=lambda item: (item.get("mount") != "/", item.get("mount") or ""))
+        summary = storage.setdefault("summary", {})
+        summary["mount_count"] = len(mounts)
+        summary["mounted_count"] = sum(1 for item in mounts if item.get("status") == "mounted")
+        summary["mount_issue_count"] = sum(
+            1
+            for item in mounts
+            if item.get("status") == "unresponsive" or (item.get("expected") and item.get("status") != "mounted")
+        )
+        summary["network_mount_count"] = sum(1 for item in mounts if item.get("kind") == "network")
+
     def request_machines(self):
         return [request_machine(server) for server in self.servers]
 
@@ -397,6 +441,10 @@ class Monitor:
             "gpu_critical_percent": 98,
             "disk_warn_percent": 90,
             "disk_critical_percent": 95,
+            "inode_warn_percent": 90,
+            "inode_critical_percent": 98,
+            "mount_latency_warn_ms": 2000,
+            "mount_latency_critical_ms": 5000,
         }
         configured = self.config.get("alert_thresholds") or {}
         for key, value in configured.items():
@@ -524,8 +572,8 @@ class Monitor:
         alerts.sort(key=lambda item: (0 if item.get("severity") == "critical" else 1, item.get("server_name", "")))
         return alerts
 
-    def alert_item(self, result, severity, kind, metric=None, value=None, threshold=None):
-        return {
+    def alert_item(self, result, severity, kind, metric=None, value=None, threshold=None, **details):
+        item = {
             "server_id": result.get("id"),
             "server_name": result.get("name") or result.get("id"),
             "group": result.get("group"),
@@ -537,6 +585,8 @@ class Monitor:
             "threshold": rounded(threshold),
             "collected_at": result.get("collected_at"),
         }
+        item.update({key: value for key, value in details.items() if value not in (None, "")})
+        return item
 
     def alerts_for_result(self, result):
         if result.get("status") != "online":
@@ -561,6 +611,125 @@ class Monitor:
             severity = "critical" if critical is not None and number >= critical else "warning"
             threshold = critical if severity == "critical" else warn
             alerts.append(self.alert_item(result, severity, kind, metric, number, threshold))
+
+        storage = metrics.get("storage") or {}
+        for mount in storage.get("mounts") or []:
+            mount_path = mount.get("mount") or "mount"
+            status = mount.get("status")
+            if mount.get("expected") and status != "mounted":
+                message = {
+                    "automount_only": "automatic mount placeholder is active but the real filesystem is not mounted",
+                    "unresponsive": "network storage connection is unavailable",
+                    "missing": "configured filesystem is not mounted",
+                }.get(status, "filesystem is unavailable")
+                alerts.append(
+                    self.alert_item(
+                        result,
+                        "critical",
+                        "mount",
+                        "Mount",
+                        path=mount_path,
+                        source=mount.get("source"),
+                        message=message,
+                    )
+                )
+                continue
+            if status == "unresponsive":
+                alerts.append(
+                    self.alert_item(
+                        result,
+                        "warning",
+                        "mount",
+                        "Mount",
+                        path=mount_path,
+                        source=mount.get("source"),
+                        message="active filesystem did not respond before the timeout",
+                    )
+                )
+                continue
+            if status != "mounted":
+                continue
+            if mount.get("read_only") and mount.get("expected") and not mount.get("read_only_expected"):
+                alerts.append(
+                    self.alert_item(
+                        result,
+                        "critical",
+                        "mount_read_only",
+                        "Mount",
+                        path=mount_path,
+                        source=mount.get("source"),
+                        message="filesystem is mounted read-only",
+                    )
+                )
+            if mount_path != "/":
+                used = as_number(mount.get("percent"))
+                warn = self.alert_thresholds.get("disk_warn_percent")
+                critical = self.alert_thresholds.get("disk_critical_percent")
+                if used is not None and warn is not None and used >= warn:
+                    severity = "critical" if critical is not None and used >= critical else "warning"
+                    alerts.append(
+                        self.alert_item(
+                            result,
+                            severity,
+                            "storage",
+                            "Disk",
+                            used,
+                            critical if severity == "critical" else warn,
+                            path=mount_path,
+                            source=mount.get("source"),
+                        )
+                    )
+            inode = as_number(mount.get("inode_percent"))
+            inode_warn = self.alert_thresholds.get("inode_warn_percent")
+            inode_critical = self.alert_thresholds.get("inode_critical_percent")
+            if inode is not None and inode_warn is not None and inode >= inode_warn:
+                severity = "critical" if inode_critical is not None and inode >= inode_critical else "warning"
+                alerts.append(
+                    self.alert_item(
+                        result,
+                        severity,
+                        "inode",
+                        "Inode",
+                        inode,
+                        inode_critical if severity == "critical" else inode_warn,
+                        path=mount_path,
+                        source=mount.get("source"),
+                    )
+                )
+            if mount.get("kind") == "network":
+                latency = as_number(mount.get("latency_ms"))
+                latency_warn = self.alert_thresholds.get("mount_latency_warn_ms")
+                latency_critical = self.alert_thresholds.get("mount_latency_critical_ms")
+                if latency is not None and latency_warn is not None and latency >= latency_warn:
+                    severity = "critical" if latency_critical is not None and latency >= latency_critical else "warning"
+                    alerts.append(
+                        self.alert_item(
+                            result,
+                            severity,
+                            "mount_latency",
+                            "Mount latency",
+                            latency,
+                            latency_critical if severity == "critical" else latency_warn,
+                            path=mount_path,
+                            source=mount.get("source"),
+                        )
+                    )
+
+        for device in storage.get("devices") or []:
+            smart = device.get("smart") or {}
+            health = smart.get("health")
+            if health not in ("warning", "failed"):
+                continue
+            alerts.append(
+                self.alert_item(
+                    result,
+                    "critical" if health == "failed" else "warning",
+                    "smart",
+                    "SMART",
+                    device=device.get("name"),
+                    message=", ".join(smart.get("messages") or []) or "disk health warning",
+                )
+            )
         return alerts
 
     def record_history(self, snapshot):
@@ -708,6 +877,7 @@ class Monitor:
                 metrics = self.collect_local()
             else:
                 metrics = self.collect_ssh(server)
+            self.apply_storage_expectations(server, metrics)
             latency_ms = int((time.time() - started) * 1000)
             result = {
                 **public_server(server),

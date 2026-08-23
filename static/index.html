@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Server Probe Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260611-clock-weather" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260823-storage" />
   </head>
   <body>
     <div class="app-shell">
@@ -22,6 +22,11 @@
           <div class="stat-chip danger"><span id="offlineCount">0</span><small>离线</small></div>
         </div>
       </header>
+
+      <nav class="view-tabs" aria-label="监控视图">
+        <button class="active" type="button" data-view="monitor" aria-pressed="true">设备监控</button>
+        <button type="button" data-view="storage" aria-pressed="false">存储与 NAS</button>
+      </nav>
 
       <section class="toolbar" aria-label="筛选">
         <div class="field">
@@ -41,6 +46,7 @@
             <option value="cpu">CPU</option>
             <option value="mem">内存</option>
             <option value="gpu">GPU</option>
+            <option value="storage">存储占用</option>
             <option value="status">状态</option>
           </select>
         </div>
@@ -59,7 +65,18 @@
           <span id="refreshState">60s 刷新</span>
         </div>
         <section id="alertPanel" class="alert-panel" hidden></section>
-        <section id="serverGrid" class="server-grid" aria-live="polite"></section>
+        <section id="monitorView">
+          <section id="serverGrid" class="server-grid" aria-live="polite"></section>
+        </section>
+        <section id="storageView" hidden>
+          <div class="storage-overview" aria-live="polite">
+            <div><span id="storageMountedCount">0</span><small>挂载正常</small></div>
+            <div class="warn"><span id="storageIssueCount">0</span><small>挂载异常</small></div>
+            <div><span id="storageDeviceCount">0</span><small>本地磁盘</small></div>
+            <div class="warn"><span id="storageSmartIssueCount">0</span><small>SMART 告警</small></div>
+          </div>
+          <section id="storageGrid" class="storage-grid" aria-live="polite"></section>
+        </section>
       </main>
     </div>
 
@@ -105,6 +122,6 @@
       </article>
     </template>
 
-    <script src="/static/app.js?v=20260611-clock-weather"></script>
+    <script src="/static/app.js?v=20260823-storage"></script>
   </body>
 </html>

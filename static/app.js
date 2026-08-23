@@ -9,6 +9,7 @@ const state = {
   clockTimer: null,
   nextRefreshAt: null,
   loading: false,
+  activeView: localStorage.getItem("serverProbe.activeView") === "storage" ? "storage" : "monitor",
 };
 
 const els = {
@@ -30,7 +31,15 @@ const els = {
   lastUpdated: document.querySelector("#lastUpdated"),
   refreshState: document.querySelector("#refreshState"),
   alertPanel: document.querySelector("#alertPanel"),
+  viewTabs: document.querySelectorAll(".view-tabs button[data-view]"),
+  monitorView: document.querySelector("#monitorView"),
+  storageView: document.querySelector("#storageView"),
   serverGrid: document.querySelector("#serverGrid"),
+  storageGrid: document.querySelector("#storageGrid"),
+  storageMountedCount: document.querySelector("#storageMountedCount"),
+  storageIssueCount: document.querySelector("#storageIssueCount"),
+  storageDeviceCount: document.querySelector("#storageDeviceCount"),
+  storageSmartIssueCount: document.querySelector("#storageSmartIssueCount"),
   template: document.querySelector("#serverCardTemplate"),
 };
 
@@ -54,6 +63,16 @@ function fmtBytes(bytes) {
     index += 1;
   }
   return `${value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${units[index]}`;
+}
+
+function fmtRate(bytes) {
+  return bytes === null || bytes === undefined ? "N/A" : `${fmtBytes(bytes)}/s`;
+}
+
+function fmtMilliseconds(value) {
+  const number = finiteNumber(value);
+  if (number === null) return "N/A";
+  return number >= 1000 ? `${(number / 1000).toFixed(1)}s` : `${number.toFixed(number >= 10 ? 0 : 1)}ms`;
 }
 
 function fmtLoad(value) {
@@ -425,11 +444,29 @@ function gpuSummaryLabel(metrics) {
 
 function alertText(alert) {
   if (alert.kind === "offline") return "离线";
+  if (alert.kind === "mount" || alert.kind === "mount_read_only") {
+    const path = alert.path || "挂载点";
+    const mountMessages = {
+      "automatic mount placeholder is active but the real filesystem is not mounted": "只有自动挂载占位，真实文件系统未挂载",
+      "network storage connection is unavailable": "网络存储连接不可用",
+      "active filesystem did not respond before the timeout": "活动挂载响应超时",
+      "configured filesystem is not mounted": "配置存在但尚未挂载",
+      "filesystem is unavailable": "文件系统不可用",
+    };
+    const message = alert.kind === "mount_read_only" ? "变为只读" : mountMessages[alert.message] || alert.message || "不可用";
+    return `${path} · ${message}`;
+  }
+  if (alert.kind === "smart") return `${alert.device || "磁盘"} · ${alert.message || "SMART 异常"}`;
+  if (alert.kind === "mount_latency") {
+    return `${alert.path || "网络存储"} 延迟 ${fmtMilliseconds(alert.value)} / 阈值 ${fmtMilliseconds(alert.threshold)}`;
+  }
   const metricName = {
     cpu: "CPU",
     memory: "内存",
     gpu: "GPU",
     disk: "根分区",
+    storage: alert.path || "存储",
+    inode: `${alert.path || "存储"} inode`,
   }[alert.kind] || alert.metric || "资源";
   const value = alert.value === null || alert.value === undefined ? "" : `${fmtPercent(alert.value)}`;
   const threshold = alert.threshold === null || alert.threshold === undefined ? "" : ` / 阈值 ${fmtPercent(alert.threshold)}`;
@@ -670,7 +707,10 @@ function filteredResults() {
   if (group !== "all") results = results.filter((item) => item.group === group);
   if (search) {
     results = results.filter((item) => {
-      const haystack = `${item.id} ${item.name} ${item.host} ${item.user} ${item.group}`.toLowerCase();
+      const storage = storageMetrics(item);
+      const mounts = (storage.mounts || []).map((mount) => `${mount.mount || ""} ${mount.source || ""} ${mount.fstype || ""}`).join(" ");
+      const devices = (storage.devices || []).map((device) => `${device.name || ""} ${device.model || ""}`).join(" ");
+      const haystack = `${item.id} ${item.name} ${item.host} ${item.user} ${item.group} ${mounts} ${devices}`.toLowerCase();
       return haystack.includes(search);
     });
   }
@@ -678,6 +718,7 @@ function filteredResults() {
     if (sort === "cpu") return Number(b.metrics?.cpu?.percent || -1) - Number(a.metrics?.cpu?.percent || -1);
     if (sort === "mem") return Number(b.metrics?.memory?.percent || -1) - Number(a.metrics?.memory?.percent || -1);
     if (sort === "gpu") return Number(aggregateGpuCardValue(b.metrics) || -1) - Number(aggregateGpuCardValue(a.metrics) || -1);
+    if (sort === "storage") return storageUsageScore(b) - storageUsageScore(a);
     if (sort === "status") return healthClass(a).localeCompare(healthClass(b));
     return `${a.group}${a.name}`.localeCompare(`${b.group}${b.name}`);
   });
@@ -722,6 +763,192 @@ function renderSection(bucket) {
   return section;
 }
 
+function storageMetrics(result) {
+  return result?.metrics?.storage || { mounts: [], devices: [], summary: {} };
+}
+
+function storageUsageScore(result) {
+  const storage = storageMetrics(result);
+  const percentages = (storage.mounts || [])
+    .map((mount) => finiteNumber(mount.percent))
+    .filter((value) => value !== null);
+  const issueBoost = Number(storage.summary?.mount_issue_count || 0) * 100;
+  const smartBoost = Number(storage.summary?.smart_issue_count || 0) * 100;
+  return issueBoost + smartBoost + (percentages.length ? Math.max(...percentages) : -1);
+}
+
+function storageHostClass(result) {
+  if (result.status !== "online") return "offline";
+  const storage = storageMetrics(result);
+  const mounts = storage.mounts || [];
+  const smart = storage.devices || [];
+  if (
+    mounts.some((mount) => (mount.expected && mount.status !== "mounted") || (mount.read_only && !mount.read_only_expected)) ||
+    smart.some((device) => device.smart?.health === "failed") ||
+    mounts.some((mount) => finiteNumber(mount.percent) !== null && Number(mount.percent) >= 95)
+  ) {
+    return "critical";
+  }
+  if (
+    mounts.some((mount) => mount.status === "unresponsive") ||
+    smart.some((device) => device.smart?.health === "warning") ||
+    mounts.some((mount) => finiteNumber(mount.percent) !== null && Number(mount.percent) >= 90)
+  ) {
+    return "warning";
+  }
+  return "healthy";
+}
+
+function mountState(mount) {
+  if (mount.status === "unresponsive") return { label: "无响应", className: mount.expected ? "critical" : "warning" };
+  if (mount.status === "automount_only") return { label: "仅占位", className: "critical" };
+  if (mount.status === "missing") {
+    return { label: mount.expected ? "未挂载" : "未使用", className: mount.expected ? "critical" : "muted" };
+  }
+  if (mount.read_only && !mount.read_only_expected) return { label: "只读", className: "critical" };
+  if (mount.read_only) return { label: "只读正常", className: "muted" };
+  return { label: "正常", className: "healthy" };
+}
+
+function smartState(smart) {
+  const health = smart?.health;
+  if (health === "failed") return { label: "故障", className: "critical" };
+  if (health === "warning") return { label: "告警", className: "warning" };
+  if (health === "passed") return { label: "正常", className: "healthy" };
+  if (health === "standby") return { label: "待机", className: "muted" };
+  return { label: smart?.available ? "未知" : "未采集", className: "muted" };
+}
+
+function storageBar(value) {
+  const number = finiteNumber(value);
+  const width = number === null ? 0 : Math.max(0, Math.min(100, number));
+  const level = number !== null && number >= 95 ? "critical" : number !== null && number >= 90 ? "warning" : "healthy";
+  return `<i class="storage-bar ${level}" style="--value:${width}"></i>`;
+}
+
+function renderMountRow(mount) {
+  const status = mountState(mount);
+  const usage = finiteNumber(mount.percent);
+  const inode = finiteNumber(mount.inode_percent);
+  const io = mount.io || {};
+  const capacity = usage === null
+    ? `<span class="storage-na">暂无容量数据</span>`
+    : `<div class="storage-capacity-line"><strong>${fmtPercent(usage)}</strong><span>${fmtBytes(mount.used_bytes)} / ${fmtBytes(
+        mount.total_bytes
+      )}</span></div>${storageBar(usage)}`;
+  const inodeText = inode === null ? "N/A" : fmtPercent(inode);
+  const ioText = mount.kind === "network"
+    ? "由 NAS 提供"
+    : `<span>读 ${fmtRate(io.read_bytes_per_second)}</span><span>写 ${fmtRate(io.write_bytes_per_second)}</span>`;
+  return `<div class="storage-mount-row" role="row">
+    <div class="storage-cell mount-cell" role="cell">
+      <strong>${escapeHtml(mount.mount || "-")}</strong>
+      <span>${escapeHtml((mount.fstype || "unknown").toUpperCase())}${mount.automount ? " · 自动挂载" : ""}</span>
+    </div>
+    <div class="storage-cell source-cell" role="cell" title="${escapeHtml(mount.source || "")}">${escapeHtml(mount.source || "-")}</div>
+    <div class="storage-cell capacity-cell" role="cell">${capacity}</div>
+    <div class="storage-cell inode-cell" role="cell"><span>inode</span><strong>${inodeText}</strong></div>
+    <div class="storage-cell io-cell" role="cell">${ioText}</div>
+    <div class="storage-cell latency-cell" role="cell">${mount.kind === "network" ? fmtMilliseconds(mount.latency_ms) : "本地"}</div>
+    <div class="storage-cell state-cell" role="cell"><span class="storage-state ${status.className}">${status.label}</span></div>
+  </div>`;
+}
+
+function renderDeviceRow(device) {
+  const smart = device.smart || {};
+  const status = smartState(smart);
+  const details = [];
+  if (finiteNumber(smart.temperature_c) !== null) details.push(`${Number(smart.temperature_c).toFixed(0)}°C`);
+  if (finiteNumber(smart.percentage_used) !== null) details.push(`寿命已用 ${Number(smart.percentage_used).toFixed(0)}%`);
+  if (finiteNumber(smart.power_on_hours) !== null) details.push(`通电 ${Math.round(Number(smart.power_on_hours) / 24)} 天`);
+  const errors = (smart.messages || []).join(" · ");
+  const io = device.io || {};
+  return `<div class="storage-device-row">
+    <div><strong>${escapeHtml(device.name || "disk")}</strong><span>${escapeHtml(device.model || "")}</span></div>
+    <div><span>${escapeHtml((device.transport || "block").toUpperCase())}</span><strong>${fmtBytes(device.size_bytes)}</strong></div>
+    <div><span>读 ${fmtRate(io.read_bytes_per_second)}</span><span>写 ${fmtRate(io.write_bytes_per_second)}</span></div>
+    <div title="${escapeHtml(errors)}"><span>${escapeHtml(details.join(" · ") || (smart.available ? "SMART 无详细数据" : "未安装或无权限"))}</span></div>
+    <div><span class="storage-state ${status.className}">${status.label}</span></div>
+  </div>`;
+}
+
+function renderStorageHost(result) {
+  const storage = storageMetrics(result);
+  const mounts = storage.mounts || [];
+  const devices = storage.devices || [];
+  const hostStatus = storageHostClass(result);
+  const mountIssueCount = Number(storage.summary?.mount_issue_count || 0);
+  const smartIssueCount = Number(storage.summary?.smart_issue_count || 0);
+  const fullest = (mounts || []).reduce((best, mount) => {
+    const value = finiteNumber(mount.percent);
+    return value !== null && (!best || value > best.value) ? { path: mount.mount, value } : best;
+  }, null);
+  const statusLabel = result.status !== "online"
+    ? "主机离线"
+    : mountIssueCount || smartIssueCount
+      ? `${mountIssueCount + smartIssueCount} 项异常`
+      : fullest?.value >= 90
+        ? `${fullest.path} ${fmtPercent(fullest.value)}`
+        : "存储正常";
+  const body = result.status !== "online"
+    ? `<div class="storage-host-error">${escapeHtml(result.error || "主机无法采集")}</div>`
+    : `<div class="storage-table" role="table" aria-label="${escapeHtml(result.name || result.id)} 挂载点">
+        <div class="storage-table-head" role="row">
+          <span>挂载点</span><span>来源</span><span>容量</span><span>inode</span><span>I/O</span><span>延迟</span><span>状态</span>
+        </div>
+        ${(mounts.length ? mounts.map(renderMountRow).join("") : `<div class="storage-inline-empty">暂无挂载数据</div>`)}
+      </div>
+      <div class="storage-device-block">
+        <div class="storage-device-head"><strong>物理磁盘</strong><span>${devices.length} 块${storage.smartctl_available ? " · SMART 已启用" : " · SMART 未安装"}</span></div>
+        ${devices.length ? devices.map(renderDeviceRow).join("") : `<div class="storage-inline-empty">未发现本地物理磁盘</div>`}
+      </div>`;
+  return `<section class="storage-host ${hostStatus}">
+    <div class="storage-host-head">
+      <div><span>${escapeHtml(result.group || "")}</span><h2>${escapeHtml(result.name || result.id)}</h2><p>${escapeHtml(result.host || "local")}</p></div>
+      <strong class="storage-host-state">${escapeHtml(statusLabel)}</strong>
+    </div>
+    ${body}
+  </section>`;
+}
+
+function renderStorage(results) {
+  if (!els.storageGrid) return;
+  const totals = results.reduce(
+    (acc, result) => {
+      if (result.status !== "online") {
+        acc.issues += 1;
+        return acc;
+      }
+      const summary = storageMetrics(result).summary || {};
+      acc.mounted += Number(summary.mounted_count || 0);
+      acc.issues += Number(summary.mount_issue_count || 0);
+      acc.devices += Number(summary.device_count || 0);
+      acc.smart += Number(summary.smart_issue_count || 0);
+      return acc;
+    },
+    { mounted: 0, issues: 0, devices: 0, smart: 0 }
+  );
+  els.storageMountedCount.textContent = totals.mounted;
+  els.storageIssueCount.textContent = totals.issues;
+  els.storageDeviceCount.textContent = totals.devices;
+  els.storageSmartIssueCount.textContent = totals.smart;
+  els.storageGrid.innerHTML = results.length
+    ? results.map(renderStorageHost).join("")
+    : `<div class="empty">没有匹配的机器</div>`;
+}
+
+function setActiveView(view, persist = true) {
+  state.activeView = view === "storage" ? "storage" : "monitor";
+  if (persist) localStorage.setItem("serverProbe.activeView", state.activeView);
+  if (els.monitorView) els.monitorView.hidden = state.activeView !== "monitor";
+  if (els.storageView) els.storageView.hidden = state.activeView !== "storage";
+  els.viewTabs.forEach((button) => {
+    const active = button.dataset.view === state.activeView;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+}
+
 function render() {
   const results = filteredResults();
   const counts = (state.snapshot?.results || []).reduce(
@@ -739,6 +966,8 @@ function render() {
   els.warnCount.textContent = counts.warn;
   els.offlineCount.textContent = counts.offline;
   renderAlertPanel();
+  renderStorage(results);
+  setActiveView(state.activeView, false);
   els.serverGrid.innerHTML = "";
   els.serverGrid.classList.remove("sectioned");
 
@@ -869,8 +1098,10 @@ els.autoRefresh.addEventListener("change", schedule);
 els.groupFilter.addEventListener("change", render);
 els.searchInput.addEventListener("input", render);
 els.sortSelect.addEventListener("change", render);
+els.viewTabs.forEach((button) => button.addEventListener("click", () => setActiveView(button.dataset.view)));
 
 (async function start() {
+  setActiveView(state.activeView, false);
   startUiTicker();
   loadWeather();
   setInterval(loadWeather, WEATHER_CACHE_MS);

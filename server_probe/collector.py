@@ -15,6 +15,7 @@ import socket
 import subprocess
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import pwd
@@ -141,7 +142,487 @@ def memory_info():
     }
 
 
-def disk_info():
+NETWORK_FILESYSTEMS = {"cifs", "smb3", "nfs", "nfs4", "fuse.sshfs", "sshfs"}
+PSEUDO_FILESYSTEMS = {
+    "autofs",
+    "binfmt_misc",
+    "bpf",
+    "cgroup",
+    "cgroup2",
+    "configfs",
+    "debugfs",
+    "devpts",
+    "devtmpfs",
+    "efivarfs",
+    "fusectl",
+    "hugetlbfs",
+    "mqueue",
+    "nsfs",
+    "overlay",
+    "proc",
+    "pstore",
+    "ramfs",
+    "rpc_pipefs",
+    "securityfs",
+    "squashfs",
+    "sysfs",
+    "tmpfs",
+    "tracefs",
+}
+IGNORED_MOUNT_PREFIXES = (
+    "/snap/",
+    "/var/snap/",
+    "/var/lib/docker/",
+    "/var/lib/containers/",
+    "/var/lib/kubelet/",
+    "/var/lib/calico/",
+    "/var/lib/cni/",
+    "/var/lib/containerd/",
+    "/var/lib/containerd-nydus/",
+)
+
+
+def decode_mount_field(value):
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value or "")
+
+
+def parse_mountinfo(text):
+    mounts = []
+    for line in (text or "").splitlines():
+        if " - " not in line:
+            continue
+        left, right = line.split(" - ", 1)
+        left_fields = left.split()
+        right_fields = right.split()
+        if len(left_fields) < 6 or len(right_fields) < 2:
+            continue
+        mount_point = decode_mount_field(left_fields[4])
+        mounts.append(
+            {
+                "major_minor": left_fields[2],
+                "root": decode_mount_field(left_fields[3]),
+                "mount": mount_point,
+                "fstype": right_fields[0],
+                "source": decode_mount_field(right_fields[1]),
+                "options": sorted(set(left_fields[5].split(","))),
+                "super_options": sorted(set(right_fields[2].split(","))) if len(right_fields) > 2 else [],
+            }
+        )
+    return mounts
+
+
+def parse_fstab(text):
+    mounts = {}
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        fields = stripped.split()
+        if len(fields) < 4 or fields[2] == "swap":
+            continue
+        mount_point = decode_mount_field(fields[1])
+        options = set(fields[3].split(","))
+        mounts[mount_point] = {
+            "mount": mount_point,
+            "source": decode_mount_field(fields[0]),
+            "fstype": fields[2],
+            "required": "noauto" not in options,
+            "read_only_expected": "ro" in options,
+            "automount_configured": "x-systemd.automount" in options,
+        }
+    return mounts
+
+
+def interesting_mount(mount):
+    mount_point = mount.get("mount") or ""
+    fstype = mount.get("fstype") or ""
+    source = mount.get("source") or ""
+    if mount_point == "/":
+        return True
+    if any(mount_point == prefix.rstrip("/") or mount_point.startswith(prefix) for prefix in IGNORED_MOUNT_PREFIXES):
+        return False
+    if fstype in PSEUDO_FILESYSTEMS or "/overlay2/" in mount_point or "/kubelet/pods/" in mount_point:
+        return False
+    if fstype in NETWORK_FILESYSTEMS:
+        return True
+    if source.startswith("/dev/") and fstype not in PSEUDO_FILESYSTEMS:
+        return True
+    return mount_point == "/nas" or mount_point.startswith(("/disk_", "/mnt/", "/media/", "/data"))
+
+
+def filesystem_usage(path, timeout=2.5):
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            ["stat", "-f", "-c", "%S|%b|%f|%a|%c|%d", "--", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=timeout,
+        )
+        latency_ms = round((time.monotonic() - started) * 1000.0, 1)
+        if completed.returncode != 0:
+            return {"latency_ms": latency_ms, "error": "stat failed"}
+        fields = completed.stdout.strip().split("|")
+        if len(fields) != 6:
+            return {"latency_ms": latency_ms, "error": "invalid stat output"}
+        block_size, blocks, free_blocks, available_blocks, inodes, free_inodes = [int(value) for value in fields]
+        used_blocks = max(blocks - free_blocks, 0)
+        usable_blocks = used_blocks + max(available_blocks, 0)
+        used_inodes = max(inodes - free_inodes, 0)
+        return {
+            "total_bytes": block_size * blocks,
+            "used_bytes": block_size * used_blocks,
+            "free_bytes": block_size * max(available_blocks, 0),
+            "percent": round((used_blocks / float(usable_blocks)) * 100.0, 1) if usable_blocks else None,
+            "inode_total": inodes or None,
+            "inode_used": used_inodes if inodes else None,
+            "inode_free": free_inodes if inodes else None,
+            "inode_percent": round((used_inodes / float(inodes)) * 100.0, 1) if inodes else None,
+            "latency_ms": latency_ms,
+        }
+    except subprocess.TimeoutExpired:
+        return {"latency_ms": round((time.monotonic() - started) * 1000.0, 1), "error": "timeout"}
+    except Exception:
+        return {"latency_ms": round((time.monotonic() - started) * 1000.0, 1), "error": "stat failed"}
+
+
+def parse_cifs_debug(text):
+    servers = {}
+    sections = re.split(r"(?m)(?=^\d+\) ConnectionId:)", text or "")
+    for section in sections:
+        host_match = re.search(r"Hostname:\s*(\S+)", section)
+        if not host_match:
+            continue
+        status_match = re.search(r"TCP status:\s*(\d+)", section)
+        status = int(status_match.group(1)) if status_match else None
+        servers[host_match.group(1).lower()] = {
+            "connected": status == 1 and "DISCONNECTED" not in section,
+            "tcp_status": status,
+        }
+    return servers
+
+
+def network_source_host(source, fstype):
+    text = str(source or "")
+    if fstype in ("cifs", "smb3") and text.startswith("//"):
+        return text[2:].split("/", 1)[0], 445
+    if fstype in ("nfs", "nfs4") and ":" in text:
+        return text.split(":", 1)[0].strip("[]"), 2049
+    if fstype in ("sshfs", "fuse.sshfs"):
+        host = text.split(":", 1)[0].split("@")[-1]
+        return host, 22
+    return "", None
+
+
+def network_mount_probe(mount, cifs_servers=None, timeout=3.0):
+    fstype = mount.get("fstype") or ""
+    host, port = network_source_host(mount.get("source"), fstype)
+    if not host or not port:
+        return {"connection": "unknown"}
+    if fstype in ("cifs", "smb3"):
+        debug = (cifs_servers or {}).get(host.lower())
+        if debug and not debug.get("connected"):
+            return {"connection": "disconnected", "error": "kernel CIFS session is disconnected"}
+        if debug and debug.get("connected"):
+            return {"connection": "connected"}
+    started = time.monotonic()
+    try:
+        connection = socket.create_connection((host, port), timeout=timeout)
+        connection.close()
+        return {
+            "connection": "reachable",
+            "latency_ms": round((time.monotonic() - started) * 1000.0, 1),
+        }
+    except Exception:
+        return {
+            "connection": "unreachable",
+            "latency_ms": round((time.monotonic() - started) * 1000.0, 1),
+            "error": "network service is unreachable",
+        }
+
+
+def diskstats_snapshot(text=None):
+    rows = {}
+    for line in (read_first("/proc/diskstats") if text is None else text).splitlines():
+        fields = line.split()
+        if len(fields) < 14:
+            continue
+        try:
+            rows["%s:%s" % (fields[0], fields[1])] = {
+                "name": fields[2],
+                "read_bytes_total": int(fields[5]) * 512,
+                "write_bytes_total": int(fields[9]) * 512,
+                "io_time_ms_total": int(fields[12]),
+            }
+        except Exception:
+            continue
+    return rows
+
+
+def disk_io_rate(before, after, elapsed_seconds, major_minor):
+    first = (before or {}).get(major_minor)
+    second = (after or {}).get(major_minor)
+    if not first or not second or not elapsed_seconds or elapsed_seconds <= 0:
+        return None
+    read_delta = second["read_bytes_total"] - first["read_bytes_total"]
+    write_delta = second["write_bytes_total"] - first["write_bytes_total"]
+    busy_delta = second["io_time_ms_total"] - first["io_time_ms_total"]
+    if min(read_delta, write_delta, busy_delta) < 0:
+        return None
+    return {
+        "device": second.get("name"),
+        "read_bytes_per_second": round(read_delta / float(elapsed_seconds), 1),
+        "write_bytes_per_second": round(write_delta / float(elapsed_seconds), 1),
+        "busy_percent": round(min(100.0, busy_delta / (elapsed_seconds * 10.0)), 1),
+        "read_bytes_total": second["read_bytes_total"],
+        "write_bytes_total": second["write_bytes_total"],
+    }
+
+
+def sysfs_block_devices():
+    devices = []
+    root = "/sys/class/block"
+    try:
+        names = sorted(os.listdir(root))
+    except Exception:
+        return devices
+    for name in names:
+        path = os.path.join(root, name)
+        if name.startswith(("loop", "ram", "zram", "dm-")) or name.startswith("sr"):
+            continue
+        if name.startswith("mmcblk") and ("boot" in name or "rpmb" in name):
+            continue
+        if os.path.exists(os.path.join(path, "partition")):
+            continue
+        size = numeric(read_first(os.path.join(path, "size")))
+        if not size:
+            continue
+        model = read_first(os.path.join(path, "device", "model")).replace("\x00", "").strip()
+        rotational = read_first(os.path.join(path, "queue", "rotational"))
+        syspath = os.path.realpath(path).lower()
+        if "nvme" in name or "nvme" in syspath:
+            transport = "nvme"
+        elif "mmc" in name or "mmc" in syspath:
+            transport = "mmc"
+        elif "usb" in syspath:
+            transport = "usb"
+        elif "ata" in syspath:
+            transport = "sata"
+        elif name.startswith("md"):
+            transport = "raid"
+        else:
+            transport = "block"
+        devices.append(
+            {
+                "name": name,
+                "path": "/dev/%s" % name,
+                "model": model or name,
+                "size_bytes": int(size * 512),
+                "transport": transport,
+                "rotational": rotational == "1",
+                "major_minor": read_first(os.path.join(path, "dev")),
+            }
+        )
+    return devices
+
+
+def smart_attribute(data, names):
+    table = (((data or {}).get("ata_smart_attributes") or {}).get("table") or [])
+    wanted = {name.lower() for name in names}
+    for item in table:
+        if str(item.get("name") or "").lower() not in wanted:
+            continue
+        raw = item.get("raw") or {}
+        value = raw.get("value")
+        return numeric(value if value is not None else raw.get("string"))
+    return None
+
+
+def smart_info(device):
+    base = {"available": False, "health": "unavailable"}
+    if not shutil.which("smartctl") or not os.path.exists(device.get("path") or ""):
+        return base
+    try:
+        completed = subprocess.run(
+            ["smartctl", "-n", "standby,3", "-H", "-A", "-j", device["path"]],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=3,
+        )
+        data = json.loads(completed.stdout or "{}")
+    except Exception:
+        return base
+
+    messages = []
+    passed = ((data.get("smart_status") or {}).get("passed"))
+    temperature = numeric(((data.get("temperature") or {}).get("current")))
+    nvme = data.get("nvme_smart_health_information_log") or {}
+    critical_warning = numeric(nvme.get("critical_warning")) or 0
+    media_errors = numeric(nvme.get("media_errors")) or 0
+    percentage_used = numeric(nvme.get("percentage_used"))
+    power_on_hours = numeric(((data.get("power_on_time") or {}).get("hours")))
+    if power_on_hours is None:
+        power_on_hours = smart_attribute(data, ["Power_On_Hours", "Power_On_Hours_and_Msec"])
+    reallocated = smart_attribute(data, ["Reallocated_Sector_Ct", "Reallocated_Event_Count"]) or 0
+    pending = smart_attribute(data, ["Current_Pending_Sector"]) or 0
+    uncorrectable = smart_attribute(data, ["Offline_Uncorrectable", "Reported_Uncorrect"]) or 0
+
+    health = "passed" if passed is not False else "failed"
+    if passed is False:
+        messages.append("SMART self-assessment failed")
+    if critical_warning:
+        health = "failed"
+        messages.append("NVMe critical warning %s" % int(critical_warning))
+    for label, value in (("reallocated", reallocated), ("pending", pending), ("uncorrectable", uncorrectable), ("media errors", media_errors)):
+        if value:
+            if health != "failed":
+                health = "warning"
+            messages.append("%s %s" % (label, int(value)))
+    if percentage_used is not None and percentage_used >= 90:
+        if health != "failed":
+            health = "warning"
+        messages.append("wear %s%%" % int(percentage_used))
+    if temperature is not None and temperature >= 60:
+        if health != "failed":
+            health = "warning"
+        messages.append("temperature %sC" % int(temperature))
+    if health == "passed" and passed is None and not nvme and not (data.get("ata_smart_attributes") or {}).get("table"):
+        health = "unknown"
+    return {
+        "available": True,
+        "health": health,
+        "passed": passed,
+        "temperature_c": temperature,
+        "power_on_hours": power_on_hours,
+        "percentage_used": percentage_used,
+        "reallocated_sectors": reallocated,
+        "pending_sectors": pending,
+        "uncorrectable_errors": uncorrectable,
+        "media_errors": media_errors,
+        "messages": messages,
+    }
+
+
+def storage_info(disk_before=None, disk_after=None, elapsed_seconds=None):
+    active_mounts = parse_mountinfo(read_first("/proc/self/mountinfo"))
+    configured = parse_fstab(read_first("/etc/fstab"))
+    by_path = {}
+    for mount in active_mounts:
+        by_path.setdefault(mount["mount"], []).append(mount)
+
+    paths = {"/"}
+    for mount in active_mounts:
+        if interesting_mount(mount):
+            paths.add(mount["mount"])
+    for mount_point, item in configured.items():
+        candidate = dict(item)
+        if item.get("required") and interesting_mount(candidate):
+            paths.add(mount_point)
+
+    mounts = []
+    for mount_point in sorted(paths, key=lambda value: (value != "/", value)):
+        entries = by_path.get(mount_point, [])
+        real_entries = [entry for entry in entries if entry.get("fstype") != "autofs"]
+        selected = real_entries[-1] if real_entries else (entries[-1] if entries else {})
+        expected = configured.get(mount_point) or {}
+        has_automount = any(entry.get("fstype") == "autofs" for entry in entries) or expected.get("automount_configured", False)
+        if real_entries:
+            status = "mounted"
+        elif entries:
+            status = "automount_only"
+        else:
+            status = "missing"
+        if real_entries:
+            fstype = selected.get("fstype") or expected.get("fstype") or ""
+            source = selected.get("source") or expected.get("source") or ""
+        else:
+            fstype = expected.get("fstype") or selected.get("fstype") or ""
+            source = expected.get("source") or selected.get("source") or ""
+        options = set(selected.get("options") or []) | set(selected.get("super_options") or [])
+        mounts.append(
+            {
+                "mount": mount_point,
+                "source": source,
+                "fstype": fstype,
+                "kind": "network" if fstype in NETWORK_FILESYSTEMS or str(source).startswith("//") else ("automount" if fstype == "autofs" else "local"),
+                "status": status,
+                "expected": bool(expected.get("required", mount_point == "/")),
+                "read_only_expected": bool(expected.get("read_only_expected", False)),
+                "automount": has_automount,
+                "read_only": "ro" in options,
+                "major_minor": selected.get("major_minor"),
+            }
+        )
+
+    mounted_local = [item for item in mounts if item["status"] == "mounted" and item.get("kind") != "network"]
+    if mounted_local:
+        workers = min(6, len(mounted_local))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            usages = list(executor.map(lambda item: filesystem_usage(item["mount"], timeout=2.5), mounted_local))
+        for item, usage in zip(mounted_local, usages):
+            item.update(usage)
+            if usage.get("error"):
+                item["status"] = "unresponsive"
+            io = disk_io_rate(disk_before, disk_after, elapsed_seconds, item.get("major_minor"))
+            if io:
+                item["io"] = io
+
+    mounted_network = [item for item in mounts if item["status"] == "mounted" and item.get("kind") == "network"]
+    if mounted_network:
+        cifs_servers = parse_cifs_debug(read_first("/proc/fs/cifs/DebugData"))
+        workers = min(6, len(mounted_network))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            probes = list(executor.map(lambda item: network_mount_probe(item, cifs_servers), mounted_network))
+        for item, probe in zip(mounted_network, probes):
+            item.update(probe)
+            if probe.get("error"):
+                item["status"] = "unresponsive"
+
+    devices = sysfs_block_devices()
+    if devices:
+        workers = min(4, len(devices))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            smart_rows = list(executor.map(smart_info, devices))
+        for device, smart in zip(devices, smart_rows):
+            device["smart"] = smart
+            io = disk_io_rate(disk_before, disk_after, elapsed_seconds, device.get("major_minor"))
+            if io:
+                device["io"] = io
+
+    mount_issues = sum(
+        1
+        for item in mounts
+        if item.get("status") == "unresponsive" or (item.get("expected") and item.get("status") != "mounted")
+    )
+    smart_issues = sum(1 for item in devices if (item.get("smart") or {}).get("health") in ("warning", "failed"))
+    return {
+        "mounts": mounts,
+        "devices": devices,
+        "smartctl_available": bool(shutil.which("smartctl")),
+        "summary": {
+            "mount_count": len(mounts),
+            "mounted_count": sum(1 for item in mounts if item.get("status") == "mounted"),
+            "mount_issue_count": mount_issues,
+            "network_mount_count": sum(1 for item in mounts if item.get("kind") == "network"),
+            "device_count": len(devices),
+            "smart_issue_count": smart_issues,
+        },
+    }
+
+
+def disk_info(storage=None):
+    if storage:
+        for item in storage.get("mounts") or []:
+            if item.get("mount") == "/" and item.get("status") == "mounted":
+                return {
+                    "mount": "/",
+                    "total_bytes": item.get("total_bytes"),
+                    "used_bytes": item.get("used_bytes"),
+                    "free_bytes": item.get("free_bytes"),
+                    "percent": item.get("percent"),
+                }
     try:
         stat = os.statvfs("/")
         total = stat.f_frsize * stat.f_blocks
@@ -610,7 +1091,24 @@ def uptime_seconds():
 
 
 def collect():
+    disk_before = diskstats_snapshot()
+    io_started = time.monotonic()
     load1, load5, load15 = load_average()
+    cpu = {
+        "percent": cpu_percent(),
+        "cores": os.cpu_count(),
+        "load1": load1,
+        "load5": load5,
+        "load15": load15,
+    }
+    memory = memory_info()
+    gpu = gpu_info()
+    processes = {
+        "top_cpu": process_rows("-pcpu", 10),
+        "top_mem": process_rows("-pmem", 10),
+    }
+    disk_after = diskstats_snapshot()
+    storage = storage_info(disk_before, disk_after, max(time.monotonic() - io_started, 0.001))
     return {
         "collected_unix": int(time.time()),
         "host": {
@@ -620,20 +1118,12 @@ def collect():
             "machine": platform.machine(),
         },
         "uptime_seconds": uptime_seconds(),
-        "cpu": {
-            "percent": cpu_percent(),
-            "cores": os.cpu_count(),
-            "load1": load1,
-            "load5": load5,
-            "load15": load15,
-        },
-        "memory": memory_info(),
-        "disk": disk_info(),
-        "gpu": gpu_info(),
-        "processes": {
-            "top_cpu": process_rows("-pcpu", 10),
-            "top_mem": process_rows("-pmem", 10),
-        },
+        "cpu": cpu,
+        "memory": memory,
+        "disk": disk_info(storage),
+        "storage": storage,
+        "gpu": gpu,
+        "processes": processes,
     }
 
 
