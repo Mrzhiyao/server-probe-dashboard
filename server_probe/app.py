@@ -26,7 +26,7 @@ import paramiko
 from server_probe.auth import AuthStore, utc_now
 from server_probe.history import HistoryStore
 from server_probe.notifications import AlertNotificationManager, FeishuWebhookClient
-from server_probe.usage_reports import HourlyUsageReporter
+from server_probe.usage_reports import HourlyUsageReporter, current_user_usage, group_usage_rows
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -579,6 +579,53 @@ class Monitor:
         if self.usage_reporter is None:
             return {"enabled": False}
         return self.usage_reporter.status()
+
+    def user_usage_details(self, person_ref, identities=None):
+        person_ref = str(person_ref or "").strip()
+        if not person_ref:
+            return None
+        with self.snapshot_lock:
+            snapshot = self.latest_snapshot
+        if not snapshot:
+            return None
+        machines = current_user_usage(snapshot, ["root", "nobody"])
+        rows = []
+        for machine in machines:
+            for current in machine.get("users") or []:
+                row = dict(current)
+                row.update(
+                    {
+                        "server_id": machine.get("server_id"),
+                        "server_name": machine.get("server_name"),
+                        "host": machine.get("host"),
+                        "group": machine.get("group"),
+                        "memory_total_bytes": machine.get("memory_total_bytes"),
+                        "gpu_memory_total_bytes": machine.get("gpu_memory_total_bytes"),
+                        "memory_peak_bytes": current.get("memory_bytes"),
+                        "gpu_memory_peak_bytes": current.get("gpu_memory_bytes"),
+                        "cpu_average": current.get("cpu_percent"),
+                        "process_peak": current.get("process_count"),
+                        "container_peak": current.get("container_count"),
+                        "top_gpu_process": (current.get("top_gpu_processes") or [None])[0],
+                    }
+                )
+                rows.append(row)
+        identity_map = {str(key).lower(): value for key, value in (identities or {}).items()}
+        people = group_usage_rows(rows, identity_map)
+        query = person_ref.casefold()
+        for person in people:
+            names = [str(person.get("display_name") or "").casefold()]
+            names.extend(str(username).casefold() for username in person.get("usernames") or [])
+            if query not in names:
+                continue
+            payload = dict(person)
+            payload.pop("person_key", None)
+            return {
+                "generated_at": snapshot.get("generated_at"),
+                "refresh_seconds": self.refresh_seconds,
+                "person": payload,
+            }
+        return None
 
     def empty_snapshot(self):
         return {
@@ -2034,6 +2081,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_file(STATIC_DIR / "requests.html")
             return
 
+        if route == "/usage":
+            if not self.can_view_dashboard(user):
+                self.send_redirect("/requests")
+                return
+            self.send_file(STATIC_DIR / "usage.html")
+            return
+
         if route == "/api/resource-requests":
             if not self.auth_enabled:
                 self.send_json({"error": "authentication is disabled"}, status=404)
@@ -2118,6 +2172,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_redirect("/requests")
                 return
             self.send_file(STATIC_DIR / "index.html")
+            return
+
+        if route == "/api/user-usage":
+            if not self.require_dashboard_viewer(user):
+                return
+            person_ref = query.get("person", [""])[0]
+            identities = self.auth_store.resource_identity_map() if self.auth_enabled else {}
+            payload = self.monitor.user_usage_details(person_ref, identities)
+            if payload is None:
+                self.send_json({"error": "user resource details not found"}, status=404)
+                return
+            self.send_json(payload)
             return
 
         if route.startswith("/static/"):
@@ -2310,7 +2376,7 @@ def main(argv=None):
             excluded_users=excluded_users,
             max_users=configured_number("PROBE_USAGE_REPORT_MAX_USERS", usage_report_config, "max_users", 80),
             detail_users=configured_number(
-                "PROBE_USAGE_REPORT_DETAIL_USERS", usage_report_config, "detail_users", 12
+                "PROBE_USAGE_REPORT_DETAIL_USERS", usage_report_config, "detail_users", 10
             ),
             dashboard_url=os.getenv("PROBE_PUBLIC_URL") or usage_report_config.get("dashboard_url"),
             identity_provider=auth_store.resource_identity_map if auth_store else None,

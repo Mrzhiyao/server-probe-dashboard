@@ -1164,23 +1164,25 @@ def container_id_for_pid(pid, container_ids):
 
 def attach_gpu_containers(gpu, containers):
     by_id = {item.get("_full_id"): item for item in containers if item.get("_full_id")}
-    if not by_id:
-        return
     for process in (gpu or {}).get("_all_processes") or (gpu or {}).get("processes") or []:
         container_id = container_id_for_pid(process.get("pid"), by_id.keys())
-        if not container_id:
-            continue
-        container = by_id[container_id]
-        process["container_id"] = container_id[:12]
-        process["container_name"] = container.get("name")
-        container.setdefault("gpu_indices", [])
-        gpu_index = process.get("gpu_index")
-        if gpu_index not in (None, "") and str(gpu_index) not in container["gpu_indices"]:
-            container["gpu_indices"].append(str(gpu_index))
-        container["gpu_process_count"] = int(container.get("gpu_process_count") or 0) + 1
-        container["gpu_memory_used_bytes"] = int(container.get("gpu_memory_used_bytes") or 0) + int(
-            process.get("used_memory_bytes") or 0
-        )
+        if container_id:
+            container = by_id[container_id]
+            process["container_id"] = container_id[:12]
+            process["container_name"] = container.get("name")
+            process["container_image"] = container.get("image")
+            process["owner_user"] = container.get("owner_user")
+            process["owner_confidence"] = container.get("owner_confidence")
+            process["model"] = (container.get("vllm") or {}).get("model")
+            container.setdefault("gpu_indices", [])
+            gpu_index = process.get("gpu_index")
+            if gpu_index not in (None, "") and str(gpu_index) not in container["gpu_indices"]:
+                container["gpu_indices"].append(str(gpu_index))
+            container["gpu_process_count"] = int(container.get("gpu_process_count") or 0) + 1
+            container["gpu_memory_used_bytes"] = int(container.get("gpu_memory_used_bytes") or 0) + int(
+                process.get("used_memory_bytes") or 0
+            )
+        process["attributed_user"] = process.get("owner_user") or process.get("user") or "unknown"
 
 
 def docker_info():
@@ -1369,10 +1371,38 @@ def merge_gpu_process(processes, candidate):
     processes[key] = merged
 
 
-def gpu_user_summary(processes):
+def safe_process_name(value):
+    tokens = command_tokens(value)
+    text = tokens[0] if tokens else str(value or "").strip()
+    return text.replace("\\", "/").rsplit("/", 1)[-1][:120] or "unknown"
+
+
+def safe_process_label(process):
+    executable = safe_process_name(process.get("process_name") or process.get("command"))
+    if not executable.lower().startswith("python"):
+        return executable
+    tokens = command_tokens(process.get("command"))
+    for index, token in enumerate(tokens[:-1]):
+        if token != "-m":
+            continue
+        module = "".join(char for char in tokens[index + 1] if char.isalnum() or char in "._+-")
+        if module:
+            return "%s · %s" % (executable, module[:80])
+    for token in tokens[1:]:
+        if not token.lower().endswith(".py"):
+            continue
+        script = token.replace("\\", "/").rsplit("/", 1)[-1]
+        script = "".join(char for char in script if char.isalnum() or char in "._+-")
+        if script:
+            return "%s · %s" % (executable, script[:80])
+    return executable
+
+
+def gpu_user_summary(processes, prefer_attributed=False):
     users = {}
     for process in processes:
-        user = process.get("user") or "unknown"
+        user = process.get("attributed_user") if prefer_attributed else process.get("user")
+        user = user or "unknown"
         entry = users.setdefault(
             user,
             {
@@ -1390,6 +1420,7 @@ def gpu_user_summary(processes):
                 "_pids": set(),
                 "_gpus": set(),
                 "_cpu_pids": set(),
+                "_processes": {},
             },
         )
 
@@ -1403,6 +1434,33 @@ def gpu_user_summary(processes):
         used_memory = process.get("used_memory_bytes")
         if isinstance(used_memory, (int, float)):
             entry["used_memory_bytes"] += int(used_memory)
+
+        if pid not in (None, ""):
+            process_entry = entry["_processes"].setdefault(
+                str(pid),
+                {
+                    "pid": pid,
+                    "process_name": safe_process_label(process),
+                    "used_memory_bytes": 0,
+                    "gpu_indices": set(),
+                    "gpu_sm_percent_sum": 0.0,
+                    "container_name": process.get("container_name"),
+                    "container_image": process.get("container_image"),
+                    "model": process.get("model"),
+                    "runtime_seconds": process.get("runtime_seconds"),
+                    "owner_confidence": process.get("owner_confidence"),
+                },
+            )
+            if isinstance(used_memory, (int, float)):
+                process_entry["used_memory_bytes"] += int(used_memory)
+            if gpu_index not in (None, ""):
+                process_entry["gpu_indices"].add(str(gpu_index))
+            process_sm = process.get("gpu_sm_percent")
+            if isinstance(process_sm, (int, float)):
+                process_entry["gpu_sm_percent_sum"] += process_sm
+            for field in ("container_name", "container_image", "model", "runtime_seconds", "owner_confidence"):
+                if process_entry.get(field) in (None, "") and process.get(field) not in (None, ""):
+                    process_entry[field] = process.get(field)
 
         sm = process.get("gpu_sm_percent")
         if isinstance(sm, (int, float)):
@@ -1435,7 +1493,20 @@ def gpu_user_summary(processes):
         entry["gpu_mem_percent_sum"] = round(entry["gpu_mem_percent_sum"], 1)
         entry["cpu_percent_sum"] = round(entry["cpu_percent_sum"], 1)
         entry["mem_percent_sum"] = round(entry["mem_percent_sum"], 1)
-        for internal in ("_pids", "_gpus", "_cpu_pids"):
+        top_processes = []
+        for process_entry in entry["_processes"].values():
+            process_entry["gpu_indices"] = sorted(
+                process_entry["gpu_indices"], key=lambda value: int(value) if value.isdigit() else value
+            )
+            process_entry["gpu_sm_percent_sum"] = round(process_entry["gpu_sm_percent_sum"], 1)
+            top_processes.append(process_entry)
+        top_processes.sort(
+            key=lambda item: (item.get("used_memory_bytes") or 0, item.get("gpu_sm_percent_sum") or 0),
+            reverse=True,
+        )
+        entry["top_processes"] = top_processes[:5]
+        entry["top_process"] = top_processes[0] if top_processes else None
+        for internal in ("_pids", "_gpus", "_cpu_pids", "_processes"):
             entry.pop(internal, None)
         rows.append(entry)
 
@@ -1713,6 +1784,10 @@ def collect():
         }
         user_resources = user_resources_future.result()
     attach_gpu_containers(gpu, docker.get("containers") or [])
+    all_gpu_processes = gpu.get("_all_processes") or gpu.get("processes") or []
+    if all_gpu_processes:
+        gpu["user_summary"] = gpu_user_summary(all_gpu_processes, prefer_attributed=True)
+        gpu["user_summary_attributed"] = True
     gpu.pop("_all_processes", None)
     for container in docker.get("containers") or []:
         container.pop("_full_id", None)

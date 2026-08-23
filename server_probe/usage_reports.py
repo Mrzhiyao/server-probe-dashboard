@@ -3,6 +3,7 @@
 import math
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 
 from server_probe.notifications import BEIJING_TIMEZONE, clean_text, utc_iso
@@ -97,6 +98,8 @@ def current_user_usage(snapshot, excluded_users=None):
                     "container_count": 0,
                     "gpu_process_count": 0,
                     "gpu_indices": set(),
+                    "top_gpu_processes": [],
+                    "containers": [],
                 },
             )
 
@@ -110,18 +113,30 @@ def current_user_usage(snapshot, excluded_users=None):
             entry["process_count"] += int(as_number(row.get("process_count")))
             entry["running_process_count"] += int(as_number(row.get("running_process_count")))
 
-        gpu_users = ((metrics.get("gpu") or {}).get("user_summary") or [])
+        containers = ((metrics.get("docker") or {}).get("containers") or [])
+        container_owners = {
+            clean_text(container.get("owner_user"), 64)
+            for container in containers
+            if container.get("running") and clean_text(container.get("owner_user"), 64)
+        }
+        gpu_metrics = metrics.get("gpu") or {}
+        gpu_users = gpu_metrics.get("user_summary") or []
+        attributed_gpu_users = bool(gpu_metrics.get("user_summary_attributed"))
         for row in gpu_users:
             username = clean_text(row.get("user"), 64)
-            entry = users.get(username)
+            if attributed_gpu_users:
+                entry = user_entry(username) if username in users or username in container_owners else None
+            else:
+                entry = users.get(username)
             if entry is None:
                 continue
             entry["gpu_memory_bytes"] += int(as_number(row.get("used_memory_bytes")))
             entry["gpu_util_percent"] += as_number(row.get("gpu_sm_percent_sum"))
             entry["gpu_process_count"] += int(as_number(row.get("process_count")))
             entry["gpu_indices"].update(str(value) for value in (row.get("gpu_indices") or []))
+            entry["top_gpu_processes"].extend(dict(process) for process in (row.get("top_processes") or []))
 
-        for container in ((metrics.get("docker") or {}).get("containers") or []):
+        for container in containers:
             if not container.get("running"):
                 continue
             owner = clean_text(container.get("owner_user"), 64)
@@ -129,13 +144,27 @@ def current_user_usage(snapshot, excluded_users=None):
             if entry is None:
                 continue
             entry["container_count"] += 1
+            entry["containers"].append(
+                {
+                    "name": container.get("name"),
+                    "image": container.get("image"),
+                    "cpu_percent": container.get("cpu_percent"),
+                    "memory_used_bytes": container.get("memory_used_bytes"),
+                    "gpu_memory_used_bytes": container.get("gpu_memory_used_bytes"),
+                    "gpu_indices": container.get("gpu_indices") or [],
+                    "model": (container.get("vllm") or {}).get("model"),
+                    "owner_confidence": container.get("owner_confidence"),
+                }
+            )
             if runtime_user_matches_owner(container, owner, entry):
                 continue
             entry["cpu_percent"] += as_number(container.get("cpu_percent"))
             entry["memory_bytes"] += int(as_number(container.get("memory_used_bytes")))
-            entry["gpu_memory_bytes"] += int(as_number(container.get("gpu_memory_used_bytes")))
+            if not attributed_gpu_users:
+                entry["gpu_memory_bytes"] += int(as_number(container.get("gpu_memory_used_bytes")))
             entry["process_count"] += int(as_number(container.get("pids")))
-            entry["gpu_process_count"] += int(as_number(container.get("gpu_process_count")))
+            if not attributed_gpu_users:
+                entry["gpu_process_count"] += int(as_number(container.get("gpu_process_count")))
             entry["gpu_indices"].update(str(value) for value in (container.get("gpu_indices") or []))
 
         rows = []
@@ -150,6 +179,17 @@ def current_user_usage(snapshot, excluded_users=None):
             )
             if entry["gpu_memory_bytes"] and not entry["gpu_memory_capacity_bytes"]:
                 entry["gpu_memory_capacity_bytes"] = gpu_memory_total
+            entry["top_gpu_processes"].sort(
+                key=lambda process: as_number(process.get("used_memory_bytes")), reverse=True
+            )
+            entry["top_gpu_processes"] = entry["top_gpu_processes"][:5]
+            entry["containers"].sort(
+                key=lambda container: (
+                    as_number(container.get("gpu_memory_used_bytes")),
+                    as_number(container.get("memory_used_bytes")),
+                ),
+                reverse=True,
+            )
             rows.append(entry)
         rows.sort(
             key=lambda item: (
@@ -221,7 +261,7 @@ class HourlyUsageReporter:
         interval_seconds=3600,
         excluded_users=None,
         max_users=80,
-        detail_users=12,
+        detail_users=10,
         dashboard_url=None,
         send_on_start=False,
         identity_provider=None,
@@ -344,6 +384,7 @@ class HourlyUsageReporter:
                         "memory_peak_bytes": 0,
                         "gpu_memory_peak_bytes": 0,
                         "gpu_util_peak": 0.0,
+                        "top_gpu_process": None,
                         "process_peak": 0,
                         "container_peak": 0,
                         "gpu_indices": set(),
@@ -363,6 +404,13 @@ class HourlyUsageReporter:
                     entry["gpu_memory_capacity_bytes"], int(as_number(row.get("gpu_memory_capacity_bytes")))
                 )
                 entry["gpu_util_peak"] = max(entry["gpu_util_peak"], as_number(row.get("gpu_util_percent")))
+                for process in row.get("top_gpu_processes") or []:
+                    if (
+                        entry["top_gpu_process"] is None
+                        or as_number(process.get("used_memory_bytes"))
+                        > as_number(entry["top_gpu_process"].get("used_memory_bytes"))
+                    ):
+                        entry["top_gpu_process"] = dict(process)
                 entry["process_peak"] = max(entry["process_peak"], int(as_number(row.get("process_count"))))
                 entry["container_peak"] = max(entry["container_peak"], int(as_number(row.get("container_count"))))
                 entry["gpu_indices"].update(str(value) for value in (row.get("gpu_indices") or []))
@@ -457,6 +505,13 @@ class HourlyUsageReporter:
             if person.get("gpu_memory_peak_bytes"):
                 left_lines.append("显存峰值合计 %s" % format_bytes(person.get("gpu_memory_peak_bytes")))
             left_lines.append("内存峰值合计 %s" % format_bytes(person.get("memory_peak_bytes")))
+            if self.dashboard_url:
+                person_ref = display_name or (person.get("usernames") or [""])[0]
+                detail_url = "%s/usage?person=%s" % (
+                    self.dashboard_url.rstrip("/"),
+                    urllib.parse.quote(person_ref, safe=""),
+                )
+                left_lines.append("[查看详细资源](%s)" % detail_url)
             machine_blocks = []
             for row in person.get("machine_rows") or []:
                 username = clean_text(row.get("user"), 64)
@@ -477,6 +532,21 @@ class HourlyUsageReporter:
                             usage_bar(row.get("gpu_memory_peak_bytes"), row.get("gpu_memory_capacity_bytes")),
                         ]
                     )
+                    top_process = row.get("top_gpu_process") or {}
+                    if top_process:
+                        process_parts = []
+                        if top_process.get("container_name"):
+                            process_parts.append("容器 `%s`" % clean_text(top_process.get("container_name"), 80))
+                        if top_process.get("model"):
+                            process_parts.append(clean_text(top_process.get("model"), 100))
+                        elif top_process.get("process_name"):
+                            process_parts.append(clean_text(top_process.get("process_name"), 100))
+                        if top_process.get("pid") not in (None, ""):
+                            process_parts.append("PID %s" % top_process.get("pid"))
+                        process_parts.append(format_bytes(top_process.get("used_memory_bytes")))
+                        machine_lines.append(
+                            "<font color='purple'>最高显存进程</font> · %s" % " · ".join(process_parts)
+                        )
                 machine_lines.extend(
                     [
                         "内存 %s / %s"

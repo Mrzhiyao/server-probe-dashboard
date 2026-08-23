@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>用户资源详情 - Server Probe Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260824-user-usage" />
+  </head>
+  <body>
+    <div class="app-shell usage-shell">
+      <div id="toast" class="toast error" hidden></div>
+      <header class="usage-topbar">
+        <div>
+          <p class="eyebrow">User Resource Detail</p>
+          <h1 id="personName">用户资源详情</h1>
+          <p id="personAccounts" class="usage-subtitle">正在读取账号信息</p>
+        </div>
+        <div class="usage-actions">
+          <a class="button ghost link-button" href="/">监控面板</a>
+          <button id="refreshButton" class="button" type="button">刷新</button>
+          <button id="logoutButton" class="button ghost" type="button">退出</button>
+        </div>
+      </header>
+
+      <section id="usageKpis" class="usage-kpis" aria-live="polite"></section>
+
+      <div class="usage-timeline">
+        <span id="updatedAt">等待数据</span>
+        <span>当前实时快照</span>
+      </div>
+
+      <main>
+        <section id="machineList" class="usage-machine-list" aria-live="polite">
+          <div class="usage-loading">正在加载资源详情</div>
+        </section>
+      </main>
+    </div>
+    <script src="/static/usage.js?v=20260824-user-usage"></script>
+  </body>
+</html>

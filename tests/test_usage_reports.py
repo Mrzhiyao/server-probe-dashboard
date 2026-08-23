@@ -1,8 +1,10 @@
+import threading
 import unittest
 from unittest import mock
 
 from server_probe import collector
 from server_probe.auth import contains_cjk
+from server_probe.app import Monitor
 from server_probe.usage_reports import HourlyUsageReporter, current_user_usage, group_usage_rows, usage_bar
 
 
@@ -82,6 +84,7 @@ class HourlyUsageReporterTests(unittest.TestCase):
                         ],
                         "gpu": {
                             "devices": [{"index": "0", "memory_total_bytes": 8 * GIB}],
+                            "user_summary_attributed": True,
                             "user_summary": [
                                 {
                                     "user": "alice",
@@ -89,11 +92,36 @@ class HourlyUsageReporterTests(unittest.TestCase):
                                     "gpu_sm_percent_sum": 30,
                                     "process_count": 1,
                                     "gpu_indices": ["0"],
+                                    "top_processes": [
+                                        {
+                                            "pid": 321,
+                                            "process_name": "python3",
+                                            "used_memory_bytes": 2 * GIB,
+                                            "gpu_indices": ["0"],
+                                            "runtime_seconds": 7200,
+                                        }
+                                    ],
                                 },
                                 {
-                                    "user": "root",
-                                    "used_memory_bytes": 9 * GIB,
+                                    "user": "bob",
+                                    "used_memory_bytes": 4 * GIB,
                                     "gpu_indices": ["1"],
+                                    "process_count": 1,
+                                    "top_processes": [
+                                        {
+                                            "pid": 654,
+                                            "process_name": "vllm",
+                                            "used_memory_bytes": 4 * GIB,
+                                            "gpu_indices": ["1"],
+                                            "container_name": "model-api",
+                                            "model": "Qwen",
+                                        }
+                                    ],
+                                },
+                                {
+                                    "user": "gdm",
+                                    "used_memory_bytes": 128 * 1024 * 1024,
+                                    "gpu_indices": ["0"],
                                 },
                             ]
                         },
@@ -133,9 +161,11 @@ class HourlyUsageReporterTests(unittest.TestCase):
         self.assertEqual(rows["alice"]["memory_bytes"], 1 * GIB)
         self.assertEqual(rows["alice"]["gpu_memory_bytes"], 2 * GIB)
         self.assertEqual(rows["alice"]["container_count"], 1)
+        self.assertEqual(rows["alice"]["top_gpu_processes"][0]["process_name"], "python3")
         self.assertEqual(rows["bob"]["memory_bytes"], 3 * GIB)
         self.assertEqual(rows["bob"]["gpu_memory_bytes"], 4 * GIB)
         self.assertEqual(rows["bob"]["gpu_indices"], ["1"])
+        self.assertEqual(rows["bob"]["top_gpu_processes"][0]["container_name"], "model-api")
         self.assertEqual(machines[0]["memory_total_bytes"], 16 * GIB)
         self.assertEqual(machines[0]["gpu_memory_total_bytes"], 8 * GIB)
 
@@ -145,6 +175,7 @@ class HourlyUsageReporterTests(unittest.TestCase):
         reporter = HourlyUsageReporter(
             client,
             interval_seconds=3600,
+            dashboard_url="https://probe.example.test",
             identity_provider=lambda: {"alice": "Alice Chen", "bob": "Bob Li", "charlie": "Charlie Wu"},
             now_fn=lambda: now,
         )
@@ -162,6 +193,9 @@ class HourlyUsageReporterTests(unittest.TestCase):
         self.assertIn("Bob Li", rendered)
         self.assertIn("Charlie Wu", rendered)
         self.assertIn("内存重点占用", rendered)
+        self.assertIn("最高显存进程", rendered)
+        self.assertIn("python3", rendered)
+        self.assertIn("/usage?person=Alice%20Chen", rendered)
         self.assertIn("column_set", rendered)
         self.assertIn("<font color=", rendered)
         self.assertNotIn("`root`", rendered)
@@ -196,6 +230,21 @@ class HourlyUsageReporterTests(unittest.TestCase):
         self.assertEqual(people[0]["machine_count"], 2)
         self.assertEqual(people[0]["usernames"], ["c101-2-lsz", "c101-5-lsz"])
         self.assertEqual(people[0]["gpu_memory_peak_bytes"], 5 * GIB)
+
+    def test_monitor_returns_click_through_person_details(self):
+        monitor = Monitor.__new__(Monitor)
+        monitor.latest_snapshot = self.snapshot()
+        monitor.snapshot_lock = threading.Lock()
+        monitor.refresh_seconds = 60
+        payload = monitor.user_usage_details(
+            "Alice Chen",
+            {"alice": "Alice Chen", "bob": "Bob Li", "charlie": "Charlie Wu"},
+        )
+        self.assertEqual(payload["person"]["display_name"], "Alice Chen")
+        self.assertEqual(payload["person"]["machine_count"], 1)
+        machine = payload["person"]["machine_rows"][0]
+        self.assertEqual(machine["top_gpu_processes"][0]["pid"], 321)
+        self.assertEqual(machine["top_gpu_process"]["process_name"], "python3")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,8 @@ A lightweight SSH-based Linux resource dashboard. The dashboard host periodicall
 - vLLM service discovery with safe argument extraction, model/version details, and local `/health` plus `/v1/models` probing
 - Per-host history sparklines, current alerts, and per-user GPU usage summaries
 - Optional Feishu webhook notifications with alert confirmation, cooldown reminders, and recovery messages
-- Optional hourly Feishu summaries of ordinary-user CPU, memory, GPU memory, GPU indices, processes, and attributed containers
+- Optional hourly Feishu summaries of ordinary-user CPU, memory, GPU memory, top GPU processes, and attributed containers
+- Authenticated per-person drill-down pages linked from Feishu cards
 - Optional PostgreSQL metric history with restart recovery, 24-hour, 7-day, and 30-day downsampled views
 - Top CPU, memory, and GPU process tables
 - NVIDIA GPU metrics through `nvidia-smi`
@@ -103,10 +104,10 @@ PROBE_USAGE_REPORT_ENABLED=1
 PROBE_USAGE_REPORT_INTERVAL_SECONDS=3600
 PROBE_USAGE_REPORT_EXCLUDED_USERS=root,nobody
 PROBE_USAGE_REPORT_MAX_USERS=80
-PROBE_USAGE_REPORT_DETAIL_USERS=12
+PROBE_USAGE_REPORT_DETAIL_USERS=10
 ```
 
-The collector aggregates all processes owned by ordinary login UIDs once per regular dashboard refresh. The hourly report resolves account names from the PostgreSQL user and machine-account index, groups a person's accounts and machines under one display name, shows cluster summary indicators and capacity bars, then highlights GPU users and high-memory users. Machine-specific account names remain visible for auditing. Root and system accounts are omitted. This is metadata-only monitoring: process command lines, environment variables, and user files are not included in the report.
+The collector aggregates all processes owned by ordinary login UIDs once per regular dashboard refresh. The hourly report resolves account names from the PostgreSQL user and machine-account index, groups a person's accounts and machines under one display name, shows cluster summary indicators and capacity bars, then highlights GPU users and high-memory users. For each machine it also reports the process using the most GPU memory. Container processes are attributed to the inferred container owner when possible; multi-GPU memory for the same PID is combined. Machine-specific account names remain visible for auditing. Each person links to an authenticated `/usage` page with current GPU-process and container details. Root and system accounts are omitted. This is metadata-only monitoring: full process command lines, environment variables, and user files are not included in the report.
 
 Logged-in users can submit requests from `/requests`. Normal users see a submit page and their own request list. Admins see an approval page and an account-management page. Admins can grant selected normal users access to the resource dashboard with a per-user permission checkbox. Temporary account requests use the current dashboard snapshot to recommend machines. Long-term access requests can be checked against an imported machine-account index before duplicate requests are created. Admins can provision machine accounts from an approved request or directly from the account-management page when the monitored SSH user, or the optional `provision` SSH user, is root or has sudo permission.
 

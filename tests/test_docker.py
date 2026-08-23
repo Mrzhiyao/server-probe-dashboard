@@ -59,6 +59,50 @@ class DockerParserTests(unittest.TestCase):
         self.assertEqual(containers[0]["gpu_indices"], ["2"])
         self.assertEqual(containers[0]["gpu_memory_used_bytes"], 4096)
 
+    def test_gpu_summary_attributes_container_process_and_aggregates_pid_across_cards(self):
+        processes = [
+            {
+                "pid": 123,
+                "user": "root",
+                "attributed_user": "alice",
+                "gpu_index": "0",
+                "used_memory_bytes": 2_000,
+                "process_name": "/usr/bin/python3",
+                "container_name": "model-api",
+                "container_image": "vllm:latest",
+                "model": "Qwen",
+            },
+            {
+                "pid": 123,
+                "user": "root",
+                "attributed_user": "alice",
+                "gpu_index": "1",
+                "used_memory_bytes": 3_000,
+                "process_name": "/usr/bin/python3",
+                "container_name": "model-api",
+                "container_image": "vllm:latest",
+                "model": "Qwen",
+            },
+        ]
+        rows = collector.gpu_user_summary(processes, prefer_attributed=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["user"], "alice")
+        self.assertEqual(rows[0]["used_memory_bytes"], 5_000)
+        self.assertEqual(rows[0]["top_process"]["used_memory_bytes"], 5_000)
+        self.assertEqual(rows[0]["top_process"]["gpu_indices"], ["0", "1"])
+        self.assertEqual(rows[0]["top_process"]["process_name"], "python3")
+        self.assertEqual(rows[0]["top_process"]["container_name"], "model-api")
+
+    def test_python_process_label_exposes_script_but_not_arguments(self):
+        label = collector.safe_process_label(
+            {
+                "process_name": "/usr/bin/python3",
+                "command": "/usr/bin/python3 /home/alice/train_model.py --token private-value",
+            }
+        )
+        self.assertEqual(label, "python3 · train_model.py")
+        self.assertNotIn("private-value", label)
+
     def test_container_owner_prefers_explicit_label(self):
         owner = collector.infer_container_owner(
             {
