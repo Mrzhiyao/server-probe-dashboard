@@ -11,6 +11,7 @@ A lightweight SSH-based Linux resource dashboard. The dashboard host periodicall
 - vLLM service discovery with safe argument extraction, model/version details, and local `/health` plus `/v1/models` probing
 - Per-host history sparklines, current alerts, and per-user GPU usage summaries
 - Optional Feishu webhook notifications with alert confirmation, cooldown reminders, and recovery messages
+- Optional hourly Feishu summaries of ordinary-user CPU, memory, GPU memory, GPU indices, processes, and attributed containers
 - Optional PostgreSQL metric history with restart recovery, 24-hour, 7-day, and 30-day downsampled views
 - Top CPU, memory, and GPU process tables
 - NVIDIA GPU metrics through `nvidia-smi`
@@ -80,7 +81,7 @@ When authentication and history share PostgreSQL, `PROBE_AUTH_DB_DSN` is suffici
 
 ## Alert Notifications
 
-Feishu group-bot notifications are enabled when a webhook URL is present. Keep the webhook and optional signing secret in the server environment file; never place them in the inventory or frontend:
+Feishu group-bot delivery is enabled explicitly for real-time alerts, hourly usage reports, or both. Keep the webhook and optional signing secret in the server environment file; never place them in the inventory or frontend:
 
 ```ini
 PROBE_NOTIFICATIONS_ENABLED=1
@@ -93,6 +94,18 @@ PROBE_NOTIFICATION_RECOVERY_ENABLED=1
 ```
 
 The signing secret is optional when the bot has not enabled signature verification. By default, critical alerts require two consecutive samples, warnings must remain active for five minutes, active notifications repeat after a 30-minute cooldown, and recovery notifications are sent. A server going offline does not falsely resolve its earlier resource alerts; those alerts are evaluated after collection recovers.
+
+For a quieter operational summary, leave real-time alerts disabled and enable the hourly report:
+
+```ini
+PROBE_NOTIFICATIONS_ENABLED=0
+PROBE_USAGE_REPORT_ENABLED=1
+PROBE_USAGE_REPORT_INTERVAL_SECONDS=3600
+PROBE_USAGE_REPORT_EXCLUDED_USERS=root,nobody
+PROBE_USAGE_REPORT_MAX_USERS=80
+```
+
+The collector aggregates all processes owned by ordinary login UIDs once per regular dashboard refresh. The hourly report shows each active user and machine with peak resident memory, peak GPU memory, GPU indices, average CPU, peak process count, and containers whose owner can be identified. Root and system accounts are omitted. This is metadata-only monitoring: process command lines, environment variables, and user files are not included in the report.
 
 Logged-in users can submit requests from `/requests`. Normal users see a submit page and their own request list. Admins see an approval page and an account-management page. Admins can grant selected normal users access to the resource dashboard with a per-user permission checkbox. Temporary account requests use the current dashboard snapshot to recommend machines. Long-term access requests can be checked against an imported machine-account index before duplicate requests are created. Admins can provision machine accounts from an approved request or directly from the account-management page when the monitored SSH user, or the optional `provision` SSH user, is root or has sudo permission.
 

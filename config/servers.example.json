@@ -36,6 +36,13 @@
     "timeout_seconds": 5,
     "max_items": 20
   },
+  "usage_reports": {
+    "enabled": false,
+    "interval_seconds": 3600,
+    "excluded_users": ["root", "nobody"],
+    "max_users": 80,
+    "send_on_start": false
+  },
   "connect_timeout_seconds": 7,
   "command_timeout_seconds": 12,
   "concurrency": 8,

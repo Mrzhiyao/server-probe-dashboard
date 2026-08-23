@@ -777,6 +777,78 @@ def json_lines(text):
     return rows
 
 
+def login_uid_range():
+    minimum, maximum = 1000, 60000
+    for line in read_first("/etc/login.defs").splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[0] not in ("UID_MIN", "UID_MAX"):
+            continue
+        try:
+            value = int(parts[1])
+        except Exception:
+            continue
+        if parts[0] == "UID_MIN":
+            minimum = value
+        else:
+            maximum = value
+    return minimum, maximum
+
+
+def user_resource_summary():
+    command = "ps -eo uid=,user:32=,pid=,pcpu=,pmem=,rss=,etimes=,stat= --no-headers"
+    output = run(command, timeout=5)
+    uid_min, uid_max = login_uid_range()
+    users = {}
+    for line in output.splitlines():
+        parts = line.strip().split(None, 7)
+        if len(parts) < 8:
+            continue
+        uid_text, user, pid, pcpu, pmem, rss, etimes, state = parts
+        if not uid_text.isdigit():
+            continue
+        uid = int(uid_text)
+        if uid < uid_min or uid > uid_max or user == "root":
+            continue
+        if pwd is not None:
+            try:
+                user = pwd.getpwuid(uid).pw_name
+            except Exception:
+                continue
+        entry = users.setdefault(
+            user,
+            {
+                "user": user,
+                "uid": uid,
+                "process_count": 0,
+                "running_process_count": 0,
+                "cpu_percent_sum": 0,
+                "mem_percent_sum": 0,
+                "rss_bytes": 0,
+                "longest_runtime_seconds": 0,
+            },
+        )
+        entry["process_count"] += 1
+        if str(state).startswith("R"):
+            entry["running_process_count"] += 1
+        cpu = numeric(pcpu)
+        memory = numeric(pmem)
+        if cpu is not None:
+            entry["cpu_percent_sum"] += cpu
+        if memory is not None:
+            entry["mem_percent_sum"] += memory
+        entry["rss_bytes"] += bytes_from_kib(rss)
+        runtime = int(etimes) if str(etimes).isdigit() else 0
+        entry["longest_runtime_seconds"] = max(entry["longest_runtime_seconds"], runtime)
+
+    rows = []
+    for entry in users.values():
+        entry["cpu_percent_sum"] = round(entry["cpu_percent_sum"], 1)
+        entry["mem_percent_sum"] = round(entry["mem_percent_sum"], 1)
+        rows.append(entry)
+    rows.sort(key=lambda item: (item.get("rss_bytes") or 0, item.get("cpu_percent_sum") or 0), reverse=True)
+    return rows[:200]
+
+
 def size_bytes(value):
     text = str(value or "").strip().split("(", 1)[0].strip().replace(",", "")
     match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgtpe]?i?b)?", text, re.I)
@@ -1094,7 +1166,7 @@ def attach_gpu_containers(gpu, containers):
     by_id = {item.get("_full_id"): item for item in containers if item.get("_full_id")}
     if not by_id:
         return
-    for process in (gpu or {}).get("processes") or []:
+    for process in (gpu or {}).get("_all_processes") or (gpu or {}).get("processes") or []:
         container_id = container_id_for_pid(process.get("pid"), by_id.keys())
         if not container_id:
             continue
@@ -1375,7 +1447,7 @@ def gpu_user_summary(processes):
         ),
         reverse=True,
     )
-    return rows[:10]
+    return rows[:100]
 
 
 def nvidia_gpu_info():
@@ -1513,6 +1585,7 @@ def nvidia_gpu_info():
         "kind": "nvidia",
         "devices": devices,
         "processes": processes[:10],
+        "_all_processes": processes,
         "user_summary": user_summary,
     }
 
@@ -1618,11 +1691,12 @@ def collect():
     disk_before = diskstats_snapshot()
     io_started = time.monotonic()
     load1, load5, load15 = load_average()
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         gpu_future = executor.submit(gpu_info)
         docker_future = executor.submit(docker_info)
         top_cpu_future = executor.submit(process_rows, "-pcpu", 10)
         top_mem_future = executor.submit(process_rows, "-pmem", 10)
+        user_resources_future = executor.submit(user_resource_summary)
         cpu = {
             "percent": cpu_percent(),
             "cores": os.cpu_count(),
@@ -1637,7 +1711,9 @@ def collect():
             "top_cpu": top_cpu_future.result(),
             "top_mem": top_mem_future.result(),
         }
+        user_resources = user_resources_future.result()
     attach_gpu_containers(gpu, docker.get("containers") or [])
+    gpu.pop("_all_processes", None)
     for container in docker.get("containers") or []:
         container.pop("_full_id", None)
     disk_after = diskstats_snapshot()
@@ -1658,6 +1734,7 @@ def collect():
         "docker": docker,
         "gpu": gpu,
         "processes": processes,
+        "user_resources": user_resources,
     }
 
 

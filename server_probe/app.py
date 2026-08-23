@@ -26,6 +26,7 @@ import paramiko
 from server_probe.auth import AuthStore, utc_now
 from server_probe.history import HistoryStore
 from server_probe.notifications import AlertNotificationManager, FeishuWebhookClient
+from server_probe.usage_reports import HourlyUsageReporter
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -314,7 +315,7 @@ def safe_account_name(value):
 
 
 class Monitor:
-    def __init__(self, config, history_store=None, notification_manager=None):
+    def __init__(self, config, history_store=None, notification_manager=None, usage_reporter=None):
         self.config = config
         self.servers = config.get("servers", [])
         self.refresh_seconds = float(config.get("refresh_seconds", 30))
@@ -331,6 +332,7 @@ class Monitor:
         self.history_lock = threading.Lock()
         self.history_store = history_store
         self.notification_manager = notification_manager
+        self.usage_reporter = usage_reporter
         self.history_store_error = None
         self.history_cleanup_interval = float(config.get("history_cleanup_interval_seconds", 3600))
         self.last_history_cleanup_at = 0.0
@@ -542,6 +544,7 @@ class Monitor:
             with self.snapshot_lock:
                 self.latest_snapshot = snapshot
             self.process_notifications(snapshot)
+            self.process_usage_report(snapshot)
             return snapshot
         finally:
             self.refresh_lock.release()
@@ -563,6 +566,19 @@ class Monitor:
         if self.notification_manager is None:
             return {"enabled": False}
         return self.notification_manager.status()
+
+    def process_usage_report(self, snapshot):
+        if self.usage_reporter is None:
+            return
+        try:
+            self.usage_reporter.process(snapshot)
+        except Exception:
+            self.usage_reporter.record_runtime_error()
+
+    def usage_report_info(self):
+        if self.usage_reporter is None:
+            return {"enabled": False}
+        return self.usage_reporter.status()
 
     def empty_snapshot(self):
         return {
@@ -2054,6 +2070,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "persistent_history": self.monitor.persistent_history_info(),
                     "alert_thresholds": self.monitor.alert_thresholds,
                     "notifications": self.monitor.notification_info(),
+                    "usage_reports": self.monitor.usage_report_info(),
                     "groups": groups,
                     "servers": [public_server(server) for server in self.monitor.servers],
                 }
@@ -2221,51 +2238,88 @@ def main(argv=None):
         history_store.setup()
 
     notification_config = config.get("notifications") or {}
+    usage_report_config = config.get("usage_reports") or {}
     webhook_url = os.getenv("PROBE_FEISHU_WEBHOOK_URL", "").strip()
     notifications_enabled = env_bool(
         "PROBE_NOTIFICATIONS_ENABLED",
-        value_bool(notification_config.get("enabled"), False) or bool(webhook_url),
+        value_bool(notification_config.get("enabled"), False),
     )
-    notification_manager = None
-    if notifications_enabled:
+    usage_reports_enabled = env_bool(
+        "PROBE_USAGE_REPORT_ENABLED",
+        value_bool(usage_report_config.get("enabled"), False),
+    )
+
+    def configured_number(env_name, source, config_name, default):
+        value = os.getenv(env_name)
+        if value is None:
+            value = source.get(config_name, default)
+        number = as_number(value)
+        return default if number is None else number
+
+    client = None
+    if notifications_enabled or usage_reports_enabled:
         if not webhook_url:
-            raise RuntimeError("PROBE_FEISHU_WEBHOOK_URL is required when notifications are enabled")
-
-        def notification_number(env_name, config_name, default):
-            value = os.getenv(env_name)
-            if value is None:
-                value = notification_config.get(config_name, default)
-            number = as_number(value)
-            return default if number is None else number
-
+            raise RuntimeError("PROBE_FEISHU_WEBHOOK_URL is required when Feishu delivery is enabled")
         client = FeishuWebhookClient(
             webhook_url,
             signing_secret=os.getenv("PROBE_FEISHU_SIGNING_SECRET"),
-            timeout=notification_number("PROBE_NOTIFICATION_TIMEOUT_SECONDS", "timeout_seconds", 5),
+            timeout=configured_number(
+                "PROBE_FEISHU_TIMEOUT_SECONDS",
+                notification_config,
+                "timeout_seconds",
+                5,
+            ),
         )
+
+    notification_manager = None
+    if notifications_enabled:
         notification_manager = AlertNotificationManager(
             client,
-            critical_consecutive=notification_number(
-                "PROBE_NOTIFICATION_CRITICAL_CONSECUTIVE", "critical_consecutive", 2
+            critical_consecutive=configured_number(
+                "PROBE_NOTIFICATION_CRITICAL_CONSECUTIVE", notification_config, "critical_consecutive", 2
             ),
-            warning_after_seconds=notification_number(
-                "PROBE_NOTIFICATION_WARNING_AFTER_SECONDS", "warning_after_seconds", 300
+            warning_after_seconds=configured_number(
+                "PROBE_NOTIFICATION_WARNING_AFTER_SECONDS", notification_config, "warning_after_seconds", 300
             ),
-            cooldown_seconds=notification_number(
-                "PROBE_NOTIFICATION_COOLDOWN_SECONDS", "cooldown_seconds", 1800
+            cooldown_seconds=configured_number(
+                "PROBE_NOTIFICATION_COOLDOWN_SECONDS", notification_config, "cooldown_seconds", 1800
             ),
             recovery_enabled=env_bool(
                 "PROBE_NOTIFICATION_RECOVERY_ENABLED",
                 value_bool(notification_config.get("recovery_enabled"), True),
             ),
-            max_items=notification_number("PROBE_NOTIFICATION_MAX_ITEMS", "max_items", 20),
+            max_items=configured_number(
+                "PROBE_NOTIFICATION_MAX_ITEMS", notification_config, "max_items", 20
+            ),
             dashboard_url=os.getenv("PROBE_PUBLIC_URL") or notification_config.get("dashboard_url"),
+        )
+
+    usage_reporter = None
+    if usage_reports_enabled:
+        excluded_users = os.getenv("PROBE_USAGE_REPORT_EXCLUDED_USERS")
+        if excluded_users is None:
+            excluded_users = usage_report_config.get("excluded_users", ["root", "nobody"])
+        if isinstance(excluded_users, str):
+            excluded_users = [value.strip() for value in excluded_users.split(",") if value.strip()]
+        usage_reporter = HourlyUsageReporter(
+            client,
+            interval_seconds=configured_number(
+                "PROBE_USAGE_REPORT_INTERVAL_SECONDS", usage_report_config, "interval_seconds", 3600
+            ),
+            excluded_users=excluded_users,
+            max_users=configured_number("PROBE_USAGE_REPORT_MAX_USERS", usage_report_config, "max_users", 80),
+            dashboard_url=os.getenv("PROBE_PUBLIC_URL") or usage_report_config.get("dashboard_url"),
+            send_on_start=env_bool(
+                "PROBE_USAGE_REPORT_SEND_ON_START",
+                value_bool(usage_report_config.get("send_on_start"), False),
+            ),
         )
 
     DashboardHandler.monitor = Monitor(
         config,
         history_store=history_store,
         notification_manager=notification_manager,
+        usage_reporter=usage_reporter,
     )
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     print("Server probe dashboard listening on http://%s:%s" % (args.host, args.port), flush=True)
