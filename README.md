@@ -10,6 +10,7 @@ A lightweight SSH-based Linux resource dashboard. The dashboard host periodicall
 - Read-only Docker inventory with container resources, image disk usage, GPU process mapping, and expected-container alerts
 - vLLM service discovery with safe argument extraction, model/version details, and local `/health` plus `/v1/models` probing
 - Per-host history sparklines, current alerts, and per-user GPU usage summaries
+- Optional Feishu webhook notifications with alert confirmation, cooldown reminders, and recovery messages
 - Optional PostgreSQL metric history with restart recovery, 24-hour, 7-day, and 30-day downsampled views
 - Top CPU, memory, and GPU process tables
 - NVIDIA GPU metrics through `nvidia-smi`
@@ -76,6 +77,22 @@ Metric history can reuse the authentication PostgreSQL database or use a separat
 ```
 
 When authentication and history share PostgreSQL, `PROBE_AUTH_DB_DSN` is sufficient. Set `PROBE_HISTORY_DB_DSN` only when history should use a different database. Environment overrides are also available through `PROBE_HISTORY_ENABLED` and `PROBE_HISTORY_RETENTION_DAYS`.
+
+## Alert Notifications
+
+Feishu group-bot notifications are enabled when a webhook URL is present. Keep the webhook and optional signing secret in the server environment file; never place them in the inventory or frontend:
+
+```ini
+PROBE_NOTIFICATIONS_ENABLED=1
+PROBE_FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/...
+PROBE_FEISHU_SIGNING_SECRET=...
+PROBE_NOTIFICATION_CRITICAL_CONSECUTIVE=2
+PROBE_NOTIFICATION_WARNING_AFTER_SECONDS=300
+PROBE_NOTIFICATION_COOLDOWN_SECONDS=1800
+PROBE_NOTIFICATION_RECOVERY_ENABLED=1
+```
+
+The signing secret is optional when the bot has not enabled signature verification. By default, critical alerts require two consecutive samples, warnings must remain active for five minutes, active notifications repeat after a 30-minute cooldown, and recovery notifications are sent. A server going offline does not falsely resolve its earlier resource alerts; those alerts are evaluated after collection recovers.
 
 Logged-in users can submit requests from `/requests`. Normal users see a submit page and their own request list. Admins see an approval page and an account-management page. Admins can grant selected normal users access to the resource dashboard with a per-user permission checkbox. Temporary account requests use the current dashboard snapshot to recommend machines. Long-term access requests can be checked against an imported machine-account index before duplicate requests are created. Admins can provision machine accounts from an approved request or directly from the account-management page when the monitored SSH user, or the optional `provision` SSH user, is root or has sudo permission.
 
