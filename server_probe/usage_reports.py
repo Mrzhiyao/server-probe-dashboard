@@ -174,6 +174,46 @@ def current_user_usage(snapshot, excluded_users=None):
     return machines
 
 
+def group_usage_rows(rows, identities):
+    people = {}
+    for row in rows:
+        username = clean_text(row.get("user"), 64)
+        display_name = identities.get(username.lower())
+        person_key = "name:%s" % display_name.casefold() if display_name else "account:%s" % username.lower()
+        person = people.setdefault(
+            person_key,
+            {
+                "person_key": person_key,
+                "display_name": display_name,
+                "identity_known": bool(display_name),
+                "usernames": set(),
+                "machine_rows": [],
+                "machine_ids": set(),
+                "gpu_memory_peak_bytes": 0,
+                "memory_peak_bytes": 0,
+            },
+        )
+        person["usernames"].add(username)
+        person["machine_rows"].append(row)
+        person["machine_ids"].add(row.get("server_id"))
+        person["gpu_memory_peak_bytes"] += int(as_number(row.get("gpu_memory_peak_bytes")))
+        person["memory_peak_bytes"] += int(as_number(row.get("memory_peak_bytes")))
+
+    result = []
+    for person in people.values():
+        person["usernames"] = sorted(person["usernames"])
+        person["machine_count"] = len(person.pop("machine_ids"))
+        person["machine_rows"].sort(
+            key=lambda row: (
+                -(row.get("gpu_memory_peak_bytes") or 0),
+                -(row.get("memory_peak_bytes") or 0),
+                clean_text(row.get("server_name"), 120),
+            )
+        )
+        result.append(person)
+    return result
+
+
 class HourlyUsageReporter:
     def __init__(
         self,
@@ -358,32 +398,31 @@ class HourlyUsageReporter:
             for username, display_name in (identities or {}).items()
             if str(username).strip() and clean_text(display_name, 80)
         }
-        gpu_rows = sorted(
-            [row for row in rows if row.get("gpu_memory_peak_bytes")],
-            key=lambda row: (row.get("gpu_memory_peak_bytes") or 0, row.get("memory_peak_bytes") or 0),
+        people = group_usage_rows(rows, identities)
+        gpu_people = sorted(
+            [person for person in people if person.get("gpu_memory_peak_bytes")],
+            key=lambda person: (
+                person.get("gpu_memory_peak_bytes") or 0,
+                person.get("memory_peak_bytes") or 0,
+            ),
             reverse=True,
         )
         gpu_slots = max(1, int(round(self.detail_users * 2.0 / 3.0)))
-        selected_gpu = gpu_rows[:gpu_slots]
-        selected_keys = {(row.get("server_id"), row.get("user")) for row in selected_gpu}
+        selected_gpu = gpu_people[:gpu_slots]
+        selected_keys = {person.get("person_key") for person in selected_gpu}
         remaining_slots = max(self.detail_users - len(selected_gpu), 0)
-        other_rows = sorted(
+        other_people = sorted(
             [
-                row
-                for row in rows
-                if not row.get("gpu_memory_peak_bytes")
-                and (row.get("server_id"), row.get("user")) not in selected_keys
+                person
+                for person in people
+                if not person.get("gpu_memory_peak_bytes") and person.get("person_key") not in selected_keys
             ],
-            key=lambda row: (row.get("memory_peak_bytes") or 0, row.get("cpu_average") or 0),
+            key=lambda person: person.get("memory_peak_bytes") or 0,
             reverse=True,
         )
-        selected_other = other_rows[:remaining_slots]
+        selected_other = other_people[:remaining_slots]
         selected = selected_gpu + selected_other
-        known_names = {
-            identities.get(str(row.get("user") or "").lower())
-            for row in rows
-            if identities.get(str(row.get("user") or "").lower())
-        }
+        known_names = {person.get("display_name") for person in people if person.get("identity_known")}
         started = datetime.fromtimestamp(self.period_started_at, BEIJING_TIMEZONE).strftime("%m-%d %H:%M")
         finished = datetime.fromtimestamp(now, BEIJING_TIMEZONE).strftime("%m-%d %H:%M")
 
@@ -404,42 +443,54 @@ class HourlyUsageReporter:
                 ],
             }
 
-        def detail_element(row):
-            username = clean_text(row.get("user"), 64)
-            display_name = identities.get(username.lower())
+        def detail_element(person):
+            display_name = person.get("display_name")
             if display_name:
-                identity = "**%s**\n`%s`" % (display_name, username)
+                identity = "**%s**" % display_name
             else:
-                identity = "**%s**\n<font color='grey'>姓名未登记</font>" % username
-            machine = clean_text(row.get("server_name"), 120)
-            gpu_indices = ",".join(row.get("gpu_indices") or [])
-            location = machine + (" · GPU " + gpu_indices if gpu_indices else "")
-            left = "%s\n%s" % (identity, location)
-            resource_lines = []
-            if row.get("gpu_memory_peak_bytes"):
-                resource_lines.extend(
+                identity = "**%s**\n<font color='grey'>姓名未登记</font>" % (person.get("usernames") or ["-"])[0]
+            left_lines = [
+                identity,
+                "<font color='grey'>%d 个账号 · %d 台机器</font>"
+                % (len(person.get("usernames") or []), int(person.get("machine_count") or 0)),
+            ]
+            if person.get("gpu_memory_peak_bytes"):
+                left_lines.append("显存峰值合计 %s" % format_bytes(person.get("gpu_memory_peak_bytes")))
+            left_lines.append("内存峰值合计 %s" % format_bytes(person.get("memory_peak_bytes")))
+            machine_blocks = []
+            for row in person.get("machine_rows") or []:
+                username = clean_text(row.get("user"), 64)
+                machine = clean_text(row.get("server_name"), 120)
+                gpu_indices = ",".join(row.get("gpu_indices") or [])
+                machine_lines = [
+                    "**%s** · `%s`%s"
+                    % (machine, username, " · GPU " + gpu_indices if gpu_indices else "")
+                ]
+                if row.get("gpu_memory_peak_bytes"):
+                    machine_lines.extend(
+                        [
+                            "显存 %s / %s"
+                            % (
+                                format_bytes(row.get("gpu_memory_peak_bytes")),
+                                format_bytes(row.get("gpu_memory_capacity_bytes")),
+                            ),
+                            usage_bar(row.get("gpu_memory_peak_bytes"), row.get("gpu_memory_capacity_bytes")),
+                        ]
+                    )
+                machine_lines.extend(
                     [
-                        "**显存** %s / %s"
+                        "内存 %s / %s"
+                        % (format_bytes(row.get("memory_peak_bytes")), format_bytes(row.get("memory_total_bytes"))),
+                        usage_bar(row.get("memory_peak_bytes"), row.get("memory_total_bytes")),
+                        "<font color='grey'>CPU 均值 %s · 进程峰值 %d%s</font>"
                         % (
-                            format_bytes(row.get("gpu_memory_peak_bytes")),
-                            format_bytes(row.get("gpu_memory_capacity_bytes")),
+                            format_percent(row.get("cpu_average")),
+                            int(row.get("process_peak") or 0),
+                            " · 容器 %d" % int(row.get("container_peak")) if row.get("container_peak") else "",
                         ),
-                        usage_bar(row.get("gpu_memory_peak_bytes"), row.get("gpu_memory_capacity_bytes")),
                     ]
                 )
-            resource_lines.extend(
-                [
-                    "**内存** %s / %s"
-                    % (format_bytes(row.get("memory_peak_bytes")), format_bytes(row.get("memory_total_bytes"))),
-                    usage_bar(row.get("memory_peak_bytes"), row.get("memory_total_bytes")),
-                    "<font color='grey'>CPU 均值 %s · 进程峰值 %d%s</font>"
-                    % (
-                        format_percent(row.get("cpu_average")),
-                        int(row.get("process_peak") or 0),
-                        " · 容器 %d" % int(row.get("container_peak")) if row.get("container_peak") else "",
-                    ),
-                ]
-            )
+                machine_blocks.append("\n".join(machine_lines))
             return {
                 "tag": "column_set",
                 "flex_mode": "none",
@@ -450,7 +501,9 @@ class HourlyUsageReporter:
                         "width": "weighted",
                         "weight": 3,
                         "vertical_align": "top",
-                        "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": left}}],
+                        "elements": [
+                            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(left_lines)}}
+                        ],
                     },
                     {
                         "tag": "column",
@@ -458,7 +511,7 @@ class HourlyUsageReporter:
                         "weight": 5,
                         "vertical_align": "top",
                         "elements": [
-                            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(resource_lines)}}
+                            {"tag": "div", "text": {"tag": "lark_md", "content": "\n\n".join(machine_blocks)}}
                         ],
                     },
                 ],
@@ -478,8 +531,8 @@ class HourlyUsageReporter:
                 "background_style": "grey",
                 "columns": [
                     metric_column(self.period_peaks.get("active_machines", 0), "活跃机器", "blue"),
-                    metric_column(self.period_peaks.get("active_users", 0), "活跃用户", "turquoise"),
-                    metric_column(self.period_peaks.get("gpu_users", 0), "GPU 用户", "purple"),
+                    metric_column(len(people), "活跃人员", "turquoise"),
+                    metric_column(len(gpu_people), "GPU 人员", "purple"),
                     metric_column(self.latest_counts.get("offline", 0), "离线设备", "red"),
                 ],
             },
@@ -523,11 +576,11 @@ class HourlyUsageReporter:
                     "tag": "div",
                     "text": {
                         "tag": "lark_md",
-                        "content": "**GPU 使用重点** · 按显存峰值排序，展示 %d / %d 条" % (len(selected_gpu), len(gpu_rows)),
+                        "content": "**GPU 使用重点** · 按姓名合并，展示 %d / %d 人" % (len(selected_gpu), len(gpu_people)),
                     },
                 }
             )
-            elements.extend(detail_element(row) for row in selected_gpu)
+            elements.extend(detail_element(person) for person in selected_gpu)
         if selected_other:
             elements.extend(
                 [
@@ -538,15 +591,15 @@ class HourlyUsageReporter:
                     },
                 ]
             )
-            elements.extend(detail_element(row) for row in selected_other)
-        if len(rows) > len(selected):
+            elements.extend(detail_element(person) for person in selected_other)
+        if len(people) > len(selected):
             elements.append(
                 {
                     "tag": "div",
                     "text": {
                         "tag": "lark_md",
-                        "content": "<font color='grey'>其余 %d 条用户/机器记录未展开，完整数据保留在监控面板。</font>"
-                        % (len(rows) - len(selected)),
+                        "content": "<font color='grey'>其余 %d 人未展开；完整的 %d 条用户/机器记录仍保留在监控数据中。</font>"
+                        % (len(people) - len(selected), len(rows)),
                     },
                 }
             )

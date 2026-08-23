@@ -3,7 +3,7 @@ from unittest import mock
 
 from server_probe import collector
 from server_probe.auth import contains_cjk
-from server_probe.usage_reports import HourlyUsageReporter, current_user_usage, usage_bar
+from server_probe.usage_reports import HourlyUsageReporter, current_user_usage, group_usage_rows, usage_bar
 
 
 GIB = 1024 * 1024 * 1024
@@ -172,6 +172,30 @@ class HourlyUsageReporterTests(unittest.TestCase):
         self.assertIn("80%", usage_bar(8, 10))
         self.assertTrue(contains_cjk("周大智"))
         self.assertFalse(contains_cjk("student_t"))
+
+    def test_accounts_with_the_same_name_are_grouped_across_machines(self):
+        rows = [
+            {
+                "server_id": "gpu-1",
+                "server_name": "GPU 1",
+                "user": "c101-2-lsz",
+                "gpu_memory_peak_bytes": 2 * GIB,
+                "memory_peak_bytes": 1 * GIB,
+            },
+            {
+                "server_id": "gpu-2",
+                "server_name": "GPU 2",
+                "user": "c101-5-lsz",
+                "gpu_memory_peak_bytes": 3 * GIB,
+                "memory_peak_bytes": 4 * GIB,
+            },
+        ]
+        people = group_usage_rows(rows, {"c101-2-lsz": "李思泽", "c101-5-lsz": "李思泽"})
+        self.assertEqual(len(people), 1)
+        self.assertEqual(people[0]["display_name"], "李思泽")
+        self.assertEqual(people[0]["machine_count"], 2)
+        self.assertEqual(people[0]["usernames"], ["c101-2-lsz", "c101-5-lsz"])
+        self.assertEqual(people[0]["gpu_memory_peak_bytes"], 5 * GIB)
 
 
 if __name__ == "__main__":
