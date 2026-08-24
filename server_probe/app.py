@@ -63,6 +63,50 @@ def int_or_none(value):
     return int(number)
 
 
+def normalized_runtime_resource_query(value=None):
+    source = value if isinstance(value, dict) else {}
+    if isinstance(source.get("query"), dict):
+        source = source["query"]
+    scope = source.get("scope") if isinstance(source.get("scope"), dict) else {}
+    entity = str(source.get("entity") or "process").strip().lower()
+    if entity != "process":
+        entity = "process"
+    metric = str(source.get("metric") or "gpu_memory").strip().lower()
+    if metric not in ("gpu_memory", "memory", "cpu"):
+        metric = "gpu_memory"
+    try:
+        limit = max(1, min(int(source.get("limit") or 5), 15))
+    except (TypeError, ValueError):
+        limit = 5
+    try:
+        gpu_count = int(scope.get("gpu_count")) if scope.get("gpu_count") not in (None, "") else None
+    except (TypeError, ValueError):
+        gpu_count = None
+    if gpu_count is not None and not 1 <= gpu_count <= 16:
+        gpu_count = None
+
+    def text_filter(name, limit_value):
+        return " ".join(str(scope.get(name) or "").strip().split())[:limit_value] or None
+
+    return {
+        "entity": entity,
+        "metric": metric,
+        "limit": limit,
+        "scope": {
+            "machine": text_filter("machine", 120),
+            "gpu_count": gpu_count,
+            "group": text_filter("group", 80),
+            "gpu_model": text_filter("gpu_model", 80),
+            "user": text_filter("user", 80),
+        },
+    }
+
+
+def safe_process_title(value):
+    token = str(value or "").strip().split(" ", 1)[0]
+    return token.replace("\\", "/").rsplit("/", 1)[-1][:120] or "unknown"
+
+
 def env_bool(name, default=False):
     value = os.getenv(name)
     if value is None:
@@ -683,6 +727,84 @@ class Monitor:
                 active_machine_count=len(results),
                 limit=limit,
             ),
+        }
+
+    def resource_process_ranking(self, query, identities=None):
+        query = normalized_runtime_resource_query(query)
+        scope = query["scope"]
+        with self.snapshot_lock:
+            snapshot = self.latest_snapshot
+        if not snapshot:
+            return None
+        identity_map = {str(key).lower(): value for key, value in (identities or {}).items()}
+        machine_query = str(scope.get("machine") or "").casefold()
+        group_query = str(scope.get("group") or "").casefold()
+        model_query = str(scope.get("gpu_model") or "").casefold()
+        user_query = str(scope.get("user") or "").casefold()
+        rows = []
+        matched_machines = []
+        for result in snapshot.get("results") or []:
+            if result.get("status") != "online":
+                continue
+            metrics = result.get("metrics") or {}
+            devices = ((metrics.get("gpu") or {}).get("devices") or [])
+            machine_values = (result.get("id"), result.get("name"), result.get("host"))
+            if machine_query and not any(machine_query in str(value or "").casefold() for value in machine_values):
+                continue
+            if scope.get("gpu_count") and len(devices) != scope["gpu_count"]:
+                continue
+            if group_query and group_query not in str(result.get("group") or "").casefold():
+                continue
+            if model_query and not any(model_query in str(device.get("name") or "").casefold() for device in devices):
+                continue
+            matched_machines.append(
+                {"id": result.get("id"), "name": result.get("name") or result.get("id"), "group": result.get("group")}
+            )
+            if query["metric"] == "gpu_memory":
+                processes = (metrics.get("gpu") or {}).get("processes") or []
+            elif query["metric"] == "memory":
+                processes = (metrics.get("processes") or {}).get("top_mem") or []
+            else:
+                processes = (metrics.get("processes") or {}).get("top_cpu") or []
+            for process in processes:
+                username = str(process.get("attributed_user") or process.get("user") or "unknown")[:80]
+                display_name = identity_map.get(username.lower())
+                if user_query and user_query not in username.casefold() and user_query not in str(display_name or "").casefold():
+                    continue
+                if query["metric"] == "gpu_memory":
+                    metric_value = int(as_number(process.get("used_memory_bytes")) or 0)
+                elif query["metric"] == "memory":
+                    metric_value = int(as_number(process.get("rss_bytes")) or 0)
+                else:
+                    metric_value = as_number(process.get("cpu_percent")) or 0
+                gpu_indices = process.get("gpu_indices") or []
+                if not gpu_indices and process.get("gpu_index") not in (None, ""):
+                    gpu_indices = [str(process.get("gpu_index"))]
+                rows.append(
+                    {
+                        "server_id": result.get("id"),
+                        "server_name": result.get("name") or result.get("id"),
+                        "group": result.get("group"),
+                        "pid": process.get("pid"),
+                        "user": username,
+                        "display_name": display_name,
+                        "process_name": str(process.get("process_name") or safe_process_title(process.get("command")))[:120],
+                        "container_name": str(process.get("container_name") or "")[:120] or None,
+                        "model": str(process.get("model") or "")[:160] or None,
+                        "gpu_indices": [str(value)[:20] for value in gpu_indices[:16]],
+                        "gpu_memory_bytes": int(as_number(process.get("used_memory_bytes")) or 0),
+                        "memory_bytes": int(as_number(process.get("rss_bytes")) or 0),
+                        "cpu_percent": rounded(process.get("cpu_percent")),
+                        "runtime_seconds": int_or_none(process.get("runtime_seconds")),
+                        "metric_value": metric_value,
+                    }
+                )
+        rows.sort(key=lambda row: row.get("metric_value") or 0, reverse=True)
+        return {
+            "generated_at": snapshot.get("generated_at"),
+            "query": query,
+            "matched_machines": matched_machines,
+            "rows": rows[: query["limit"]],
         }
 
     def empty_snapshot(self):
@@ -2282,6 +2404,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if route == "/api/auth/logout":
             self.handle_logout()
+            return
+
+        if route == "/api/resource-query":
+            if not self.require_dashboard_viewer(user):
+                return
+            identities = self.auth_store.resource_identity_map() if self.auth_enabled else {}
+            payload = self.monitor.resource_process_ranking(self.read_json_body(), identities)
+            if payload is None:
+                self.send_json({"error": "resource query unavailable"}, status=503)
+                return
+            self.send_json(payload)
             return
 
         if route == "/api/resource-requests":

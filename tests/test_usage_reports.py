@@ -277,6 +277,42 @@ class HourlyUsageReporterTests(unittest.TestCase):
         self.assertEqual(len(payload["people"]), 2)
         self.assertEqual(payload["people"][0]["display_name"], "Bob Li")
 
+    def test_monitor_process_query_ranks_gpu_memory_without_commands(self):
+        snapshot = self.snapshot()
+        snapshot["generated_at"] = "2026-08-24T17:00:00+00:00"
+        snapshot["results"][0]["metrics"]["gpu"]["processes"] = [
+            {
+                "pid": 9790,
+                "user": "bob",
+                "process_name": "VLLM::Worker_PP",
+                "used_memory_bytes": 70 * GIB,
+                "gpu_index": "0",
+                "runtime_seconds": 7200,
+                "container_name": "model-api",
+                "model": "Qwen",
+                "command": "python secret.py --token should-not-leak",
+            },
+            {
+                "pid": 321,
+                "user": "alice",
+                "process_name": "python3",
+                "used_memory_bytes": 2 * GIB,
+                "gpu_index": "0",
+                "runtime_seconds": 3600,
+            },
+        ]
+        monitor = Monitor.__new__(Monitor)
+        monitor.latest_snapshot = snapshot
+        monitor.snapshot_lock = threading.Lock()
+        payload = monitor.resource_process_ranking(
+            {"query": {"entity": "process", "metric": "gpu_memory", "scope": {"gpu_count": 1}}},
+            {"alice": "Alice Chen", "bob": "Bob Li"},
+        )
+        self.assertEqual(payload["rows"][0]["display_name"], "Bob Li")
+        self.assertEqual(payload["rows"][0]["gpu_memory_bytes"], 70 * GIB)
+        self.assertNotIn("command", payload["rows"][0])
+        self.assertNotIn("should-not-leak", str(payload))
+
 
 if __name__ == "__main__":
     unittest.main()

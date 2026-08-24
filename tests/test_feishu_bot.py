@@ -10,8 +10,10 @@ from server_probe.feishu_bot import (
     compact_card,
     idle_gpu_card,
     machine_catalog_card,
+    normalized_resource_query,
     parse_command,
     pending_requests_card,
+    resource_query_card,
     snapshot_inventory,
     top_users_card,
 )
@@ -206,6 +208,36 @@ class FeishuCommandTests(unittest.TestCase):
         self.assertEqual(plan["filters"]["gpu_count"], 8)
         self.assertFalse(plan["filters"]["idle_only"])
         self.assertIsNone(plan["filters"]["min_free_gpu_memory_gb"])
+
+    def test_general_resource_query_is_normalized_and_rendered(self):
+        query = normalized_resource_query(
+            {"entity": "process", "metric": "gpu_memory", "limit": 50, "scope": {"gpu_count": 8}}
+        )
+        self.assertEqual(query["limit"], 15)
+        self.assertEqual(query["scope"]["gpu_count"], 8)
+        card = resource_query_card(
+            {
+                "query": query,
+                "matched_machines": [{"name": "gpu010"}],
+                "rows": [
+                    {
+                        "server_name": "gpu010",
+                        "pid": 9790,
+                        "user": "root",
+                        "process_name": "VLLM::Worker_PP",
+                        "container_name": "deepseek-v4-flash-0731",
+                        "model": "DeepSeek-V4-Flash-0731",
+                        "gpu_indices": ["2"],
+                        "gpu_memory_bytes": 70 * 1024**3,
+                        "runtime_seconds": 3600,
+                    }
+                ],
+            }
+        )
+        raw = json.dumps(card, ensure_ascii=False)
+        self.assertIn("八卡机", raw)
+        self.assertIn("deepseek-v4-flash-0731", raw)
+        self.assertIn("70.0 GB", raw)
 
     def test_account_form_and_approval_cards_use_callbacks(self):
         machines = [{"id": "gpu010", "name": "GPU10", "host": "192.0.2.10"}]

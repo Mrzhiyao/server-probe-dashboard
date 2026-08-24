@@ -34,6 +34,7 @@ ALLOWED_INTENTS = {
     "person",
     "machine",
     "machine_catalog",
+    "resource_query",
     "top_users",
     "request_account",
     "pending_requests",
@@ -95,6 +96,33 @@ def normalized_top_user_filters(value=None):
     if resource not in ("all", "gpu", "memory", "machines"):
         resource = "all"
     return {"limit": limit, "resource": resource}
+
+
+def normalized_resource_query(value=None):
+    source = value if isinstance(value, dict) else {}
+    scope = source.get("scope") if isinstance(source.get("scope"), dict) else {}
+    entity = str(source.get("entity") or "process").strip().lower()
+    if entity not in ("process",):
+        entity = "process"
+    metric = str(source.get("metric") or "gpu_memory").strip().lower()
+    if metric not in ("gpu_memory", "memory", "cpu"):
+        metric = "gpu_memory"
+    try:
+        limit = max(1, min(int(source.get("limit") or 5), 15))
+    except (TypeError, ValueError):
+        limit = 5
+    return {
+        "entity": entity,
+        "metric": metric,
+        "limit": limit,
+        "scope": {
+            "machine": " ".join(str(scope.get("machine") or "").strip().split())[:120] or None,
+            "gpu_count": normalized_gpu_count(scope.get("gpu_count")),
+            "group": " ".join(str(scope.get("group") or "").strip().split())[:80] or None,
+            "gpu_model": " ".join(str(scope.get("gpu_model") or "").strip().split())[:80] or None,
+            "user": " ".join(str(scope.get("user") or "").strip().split())[:80] or None,
+        },
+    }
 
 
 class LLMIntentRouter:
@@ -168,8 +196,18 @@ class LLMIntentRouter:
                 return self.cache[key]
         try:
             result = self.classify_many(text, previous=previous, inventory=inventory)
-        except Exception:
-            return [self.fallback_plan(text)]
+        except Exception as exc:
+            print("llm planner failed error=%s" % type(exc).__name__, flush=True)
+            fallback = self.fallback_plan(text)
+            if parse_command(text)[0] == "unknown":
+                fallback = {
+                    "intent": "clarify",
+                    "argument": "",
+                    "filters": {},
+                    "query": {},
+                    "clarification": "刚才的自然语言理解服务响应失败，请重试这句话。",
+                }
+            return [fallback]
         with self.lock:
             self.cache[key] = result
             while len(self.cache) > 256:
@@ -184,13 +222,19 @@ class LLMIntentRouter:
             "你是设备资源助手的工具规划器，负责理解自然中文、连续追问和一句话中的多个独立问题。"
             "只输出一个 JSON 对象，不要解释；格式是 {\"actions\":[...]}，按用户提问顺序最多输出 3 个动作。"
             "可选 intent：idle_gpu、person、machine、request_account、pending_requests、provision_account、"
-            "machine_catalog、top_users、admin_disabled、help、clarify、chat。"
+            "machine_catalog、resource_query、top_users、admin_disabled、help、clarify、chat。"
             "idle_gpu 用于查询机器清单、空闲机器、GPU 容量或按条件找机器。filters 可包含："
             "gpu_count（每台机器的 GPU 张数，整数或 null）、group（机器组或 null）、idle_only（布尔值）、"
             "min_free_gpu_memory_gb（要求单卡至少多少 GB 空闲显存或 null）、gpu_model（型号关键词或 null）。"
             "person 查询某个人或账号，argument 填姓名/账号；machine 查询一台明确机器，argument 填名称/IP。"
             "machine_catalog 用于解释单卡机/四卡机/八卡机等设备类别，或查询某类设备对应哪些实际机器；"
             "filters 可使用 gpu_count、group、gpu_model，但不要设置 idle_only 或显存阈值。"
+            "resource_query 用于组合式资源分析，尤其是查询某类机器/用户上的进程排行。query 格式为："
+            "{\"entity\":\"process\",\"metric\":\"gpu_memory|memory|cpu\",\"limit\":1到15,"
+            "\"scope\":{\"machine\":名称或null,\"gpu_count\":整数或null,\"group\":分组或null,"
+            "\"gpu_model\":型号或null,\"user\":用户或null}}。"
+            "只要问题同时包含资源范围、对象、比较/最高/排行等分析要求，就优先使用 resource_query；"
+            "不能因为没有旧的固定指令而退回 help。缺少执行所需条件时才用 clarify。"
             "top_users 查询本小时资源使用较高的用户；filters.limit 是 1 到 15，filters.resource 可为 all、gpu、memory、machines。"
             "request_account 是普通用户提交申请；pending_requests 是管理员看待审批；provision_account 是管理员主动开账号。"
             "删除账号、改密码、直接批准等未开放写操作用 admin_disabled。真正不明确时用 clarify，clarification 给一句具体追问。"
@@ -206,6 +250,8 @@ class LLMIntentRouter:
             "\"clarification\":\"\"}]}。"
             "示例：‘你还会啥？有哪些用户最近使用机器量很大’必须拆成两个动作：help 和 top_users，不能忽略后一个问题。"
             "示例：‘你知道八卡机是啥吗’输出 machine_catalog，filters.gpu_count=8；后端会回答当前对应机器。"
+            "示例：‘八卡机什么进程占用最高’输出 resource_query，query.entity=process、query.metric=gpu_memory、"
+            "query.limit=5、query.scope.gpu_count=8。"
             "如果 previous 显示上一句包含多个动作，而用户问‘为什么第二个没回复’，用 chat 并在 response 中说明看到的动作。"
         )
         body = {
@@ -272,6 +318,7 @@ class LLMIntentRouter:
             normalized_filters = normalized_top_user_filters(filters)
         else:
             normalized_filters = {}
+        query = normalized_resource_query(action.get("query")) if intent == "resource_query" else {}
         if intent in ("person", "machine") and not argument:
             intent = "clarify"
             action["clarification"] = "你想查询哪位用户或哪台机器？"
@@ -286,6 +333,7 @@ class LLMIntentRouter:
             "intent": intent,
             "argument": argument,
             "filters": normalized_filters,
+            "query": query,
             "clarification": clarification,
         }
 
@@ -513,6 +561,106 @@ def top_users_card(payload, filters=None):
     return compact_card("近期高资源用户", summary, sections, template="orange")
 
 
+def compact_duration(seconds):
+    seconds = int(as_number(seconds) or 0)
+    if seconds <= 0:
+        return "-"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        return "%d天%d小时" % (days, hours)
+    if hours:
+        return "%d小时%d分钟" % (hours, minutes)
+    return "%d分钟" % minutes
+
+
+def process_metric_label(metric):
+    return {"gpu_memory": "显存占用", "memory": "内存占用", "cpu": "CPU 占用"}.get(metric, "资源占用")
+
+
+def process_metric_value(row, metric):
+    if metric == "gpu_memory":
+        return format_bytes(row.get("gpu_memory_bytes"))
+    if metric == "memory":
+        return format_bytes(row.get("memory_bytes"))
+    return format_percent(row.get("cpu_percent"))
+
+
+def resource_query_scope_label(query, payload=None):
+    scope = (query or {}).get("scope") or {}
+    if scope.get("machine"):
+        return scope["machine"]
+    if scope.get("gpu_count"):
+        return machine_type_label(scope["gpu_count"])
+    if scope.get("group"):
+        return scope["group"]
+    machines = (payload or {}).get("matched_machines") or []
+    if len(machines) == 1:
+        return machines[0].get("name") or "目标机器"
+    return "匹配机器"
+
+
+def resource_query_text(payload):
+    query = (payload or {}).get("query") or {}
+    rows = (payload or {}).get("rows") or []
+    metric = query.get("metric") or "gpu_memory"
+    scope = resource_query_scope_label(query, payload)
+    if not rows:
+        return "%s中没有可识别的进程数据。" % scope
+    lines = ["%s进程排行（按%s）：" % (scope, process_metric_label(metric))]
+    for index, row in enumerate(rows, 1):
+        label = row.get("container_name") or row.get("model") or row.get("process_name") or "unknown"
+        lines.append(
+            "%d. %s · %s · PID %s · %s"
+            % (index, label, row.get("server_name") or "-", row.get("pid") or "-", process_metric_value(row, metric))
+        )
+    return "\n".join(lines)[:3900]
+
+
+def resource_query_card(payload):
+    query = (payload or {}).get("query") or {}
+    rows = (payload or {}).get("rows") or []
+    machines = (payload or {}).get("matched_machines") or []
+    metric = query.get("metric") or "gpu_memory"
+    scope = resource_query_scope_label(query, payload)
+    if not rows:
+        return compact_card(
+            "进程排行 · %s" % scope,
+            "匹配 **%d** 台机器，但当前没有可识别的进程数据。" % len(machines),
+            template="grey",
+        )
+    sections = []
+    for index, row in enumerate(rows, 1):
+        label = row.get("container_name") or row.get("model") or row.get("process_name") or "unknown"
+        user = row.get("display_name") or row.get("user") or "unknown"
+        gpu = ",".join(row.get("gpu_indices") or [])
+        lines = [
+            "机器 **%s** · 用户 **%s**" % (row.get("server_name") or "-", user),
+            "进程 `%s` · PID **%s** · 运行 **%s**"
+            % (row.get("process_name") or "unknown", row.get("pid") or "-", compact_duration(row.get("runtime_seconds"))),
+        ]
+        if gpu:
+            lines.append("GPU **%s** · 显存 **%s**" % (gpu, format_bytes(row.get("gpu_memory_bytes"))))
+        if row.get("container_name"):
+            lines.append("容器 `%s`" % row["container_name"])
+        if row.get("model"):
+            lines.append("模型 `%s`" % row["model"])
+        sections.append(
+            {
+                "title": "%d. %s · %s" % (index, label, process_metric_value(row, metric)),
+                "content": "\n".join(lines),
+            }
+        )
+    first = rows[0]
+    first_label = first.get("container_name") or first.get("model") or first.get("process_name") or "unknown"
+    summary = (
+        "范围 **%s** · 匹配 **%d** 台机器\n最高占用：**%s** · %s **%s**"
+        % (scope, len(machines), first_label, process_metric_label(metric), process_metric_value(first, metric))
+    )
+    return compact_card("进程排行 · %s" % process_metric_label(metric), summary, sections, template="orange")
+
+
 class DashboardAPI:
     def __init__(self, dsn, base_url="http://127.0.0.1:8088"):
         self.store = AuthStore(dsn, session_hours=1)
@@ -561,6 +709,9 @@ class DashboardAPI:
     def top_users(self, limit=10):
         limit = max(1, min(int(limit), 30))
         return self.get("/api/user-usage-ranking?limit=%d" % limit) or {}
+
+    def resource_query(self, query):
+        return self.post("/api/resource-query", {"query": normalized_resource_query(query)}) or {}
 
     def machines(self):
         return (self.get("/api/request-machines") or {}).get("machines") or []
@@ -712,6 +863,7 @@ class ConversationMemory:
                     "intent": intent,
                     "argument": str(plan.get("argument") or "")[:100],
                     "filters": filters,
+                    "query": normalized_resource_query(plan.get("query")) if intent == "resource_query" else {},
                 }
             )
         context = {
@@ -1646,6 +1798,9 @@ class FeishuResourceBot:
             snapshot = snapshot or self.dashboard.snapshot()
             filters = plan.get("filters") or {}
             return idle_gpu_text(snapshot, filters), idle_gpu_card(snapshot, filters)
+        if command == "resource_query":
+            payload = self.dashboard.resource_query(plan.get("query") or {})
+            return resource_query_text(payload), resource_query_card(payload)
         if command == "top_users":
             filters = plan.get("filters") or {}
             payload = self.dashboard.top_users(30)
