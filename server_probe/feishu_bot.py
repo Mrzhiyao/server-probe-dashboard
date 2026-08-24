@@ -38,6 +38,7 @@ ALLOWED_INTENTS = {
     "pending_requests",
     "provision_account",
     "admin_disabled",
+    "clarify",
 }
 
 
@@ -102,57 +103,118 @@ class LLMIntentRouter:
         return self.base_url + "/v1/chat/completions"
 
     def route(self, text):
-        deterministic = parse_command(text)
-        if deterministic[0] != "unknown":
-            return deterministic
-        if not self.enabled:
+        return self.as_legacy_route(self.plan(text))
+
+    def route_with_context(self, text, previous=None):
+        return self.as_legacy_route(self.plan(text, previous=previous))
+
+    def fallback_plan(self, text):
+        intent, argument = parse_command(text)
+        if intent == "unknown":
+            intent = "help"
+        return {
+            "intent": intent,
+            "argument": argument,
+            "filters": {},
+            "clarification": "",
+        }
+
+    def as_legacy_route(self, plan):
+        intent = plan.get("intent") or "help"
+        if intent == "clarify":
             return "help", ""
-        key = clean_command(text).lower()[:300]
+        argument = plan.get("argument") or ""
+        if intent == "idle_gpu" and plan.get("filters", {}).get("gpu_count"):
+            argument = str(plan["filters"]["gpu_count"])
+        return intent, argument
+
+    def plan(self, text, previous=None, inventory=None):
+        text = clean_command(text)[:500]
+        safety_guard = parse_command(text)
+        if safety_guard[0] == "admin_disabled":
+            return self.fallback_plan(text)
+        if not self.enabled:
+            return self.fallback_plan(text)
+        if isinstance(previous, (list, tuple)) and len(previous) >= 2:
+            previous = {"intent": previous[0], "argument": previous[1], "filters": {}}
+        previous = previous if isinstance(previous, dict) else {}
+        inventory = inventory if isinstance(inventory, dict) else {}
+        key = (
+            text.lower(),
+            json.dumps(previous, ensure_ascii=False, sort_keys=True)[:1000],
+            json.dumps(inventory, ensure_ascii=False, sort_keys=True)[:1000],
+        )
         with self.lock:
             if key in self.cache:
                 return self.cache[key]
         try:
-            result = self.classify(key)
+            result = self.classify(text, previous=previous, inventory=inventory)
         except Exception:
-            return "help", ""
+            return self.fallback_plan(text)
         with self.lock:
             self.cache[key] = result
             while len(self.cache) > 256:
                 self.cache.popitem(last=False)
         return result
 
-    def classify(self, text):
+    def classify(self, text, previous=None, inventory=None):
         system_prompt = (
-            "你是设备监控机器人的意图分类器。只输出一个 JSON 对象，不要解释。"
-            "intent 只能是 help、idle_gpu、person、machine、request_account、pending_requests、provision_account、admin_disabled。"
-            "查询某个人当前资源用 person，argument 填姓名或账号；查询某台机器用 machine，argument 填机器名或IP；"
-            "查询空闲显卡用 idle_gpu；用户想提交申请用 request_account；管理员查看待审批用 pending_requests；"
-            "管理员主动开通账号用 provision_account；删除、改密码、直接批准等其他写操作必须用 admin_disabled；其余用 help。"
-            "格式为 {\"intent\":\"person\",\"argument\":\"崔涵帅\"}。"
+            "你是设备资源助手的工具规划器，负责理解自然中文和连续追问。只输出一个 JSON 对象，不要解释。"
+            "可选 intent：idle_gpu、person、machine、request_account、pending_requests、provision_account、"
+            "admin_disabled、help、clarify。"
+            "idle_gpu 用于查询机器清单、空闲机器、GPU 容量或按条件找机器。filters 可包含："
+            "gpu_count（每台机器的 GPU 张数，整数或 null）、group（机器组或 null）、idle_only（布尔值）、"
+            "min_free_gpu_memory_gb（要求单卡至少多少 GB 空闲显存或 null）、gpu_model（型号关键词或 null）。"
+            "person 查询某个人或账号，argument 填姓名/账号；machine 查询一台明确机器，argument 填名称/IP。"
+            "request_account 是普通用户提交申请；pending_requests 是管理员看待审批；provision_account 是管理员主动开账号。"
+            "删除账号、改密码、直接批准等未开放写操作用 admin_disabled。真正不明确时用 clarify，clarification 给一句具体追问。"
+            "结合 previous 理解‘那四卡机呢’‘它呢’等追问，并继承仍然适用的条件。"
+            "inventory 仅说明系统现有分组和 GPU 张数类型，不要臆造机器或资源数据。"
+            "示例：‘查空闲机器吧，四卡机的呢’应输出 "
+            "{\"intent\":\"idle_gpu\",\"argument\":\"\",\"filters\":{\"gpu_count\":4,"
+            "\"group\":null,\"idle_only\":true,\"min_free_gpu_memory_gb\":null,\"gpu_model\":null},"
+            "\"clarification\":\"\"}。"
         )
         body = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": str(text)[:300]},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "text": str(text)[:500],
+                            "previous": previous or {},
+                            "inventory": inventory or {},
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
             ],
             "temperature": 0,
-            "max_tokens": 120,
+            "max_tokens": 640,
         }
         headers = {"Content-Type": "application/json", "User-Agent": "server-probe-feishu-bot"}
         if self.api_key:
             headers["Authorization"] = "Bearer " + self.api_key
-        request = urllib.request.Request(
-            self.endpoint(),
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        with self.opener(request, timeout=self.timeout) as response:
-            payload = json.load(response)
-        content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
-        if isinstance(content, list):
-            content = "".join(str(item.get("text") or "") if isinstance(item, dict) else str(item) for item in content)
+        content = ""
+        for attempt in range(2):
+            body["max_tokens"] = 640 if attempt == 0 else 1000
+            request = urllib.request.Request(
+                self.endpoint(),
+                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with self.opener(request, timeout=self.timeout) as response:
+                payload = json.load(response)
+            content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+            if isinstance(content, list):
+                content = "".join(
+                    str(item.get("text") or "") if isinstance(item, dict) else str(item) for item in content
+                )
+            if content:
+                break
         match = re.search(r"\{.*\}", str(content), re.S)
         if not match:
             raise ValueError("LLM did not return JSON")
@@ -160,10 +222,21 @@ class LLMIntentRouter:
         intent = str(parsed.get("intent") or "help").strip()
         argument = " ".join(str(parsed.get("argument") or "").strip().split())[:100]
         if intent not in ALLOWED_INTENTS:
-            return "help", ""
+            intent = "help"
+        filters = parsed.get("filters") if isinstance(parsed.get("filters"), dict) else {}
+        normalized_filters = normalized_resource_filters(filters)
         if intent in ("person", "machine") and not argument:
-            return "help", ""
-        return intent, argument
+            intent = "clarify"
+            parsed["clarification"] = "你想查询哪位用户或哪台机器？"
+        clarification = " ".join(str(parsed.get("clarification") or "").strip().split())[:240]
+        if intent == "clarify" and not clarification:
+            clarification = "请再补充一下要查询的人、机器或资源条件。"
+        return {
+            "intent": intent,
+            "argument": argument,
+            "filters": normalized_filters if intent == "idle_gpu" else {},
+            "clarification": clarification,
+        }
 
 
 def compact_card(title, summary, sections=None, template="turquoise"):
@@ -404,6 +477,42 @@ class MessageDeduplicator:
             return True
 
 
+class ConversationMemory:
+    def __init__(self, limit=2000, ttl_seconds=900):
+        self.limit = int(limit)
+        self.ttl_seconds = float(ttl_seconds)
+        self.values = OrderedDict()
+        self.lock = threading.Lock()
+
+    def get(self, key):
+        now = time.time()
+        with self.lock:
+            item = self.values.get(key)
+            if not item:
+                return None
+            result, timestamp = item
+            if now - timestamp > self.ttl_seconds:
+                self.values.pop(key, None)
+                return None
+            self.values.move_to_end(key)
+            return result
+
+    def remember(self, key, user_text, plan):
+        context = {
+            "user_text": clean_command(user_text)[:500],
+            "plan": {
+                "intent": str(plan.get("intent") or "help"),
+                "argument": str(plan.get("argument") or "")[:100],
+                "filters": normalized_resource_filters(plan.get("filters")),
+            },
+        }
+        with self.lock:
+            self.values[key] = (context, time.time())
+            self.values.move_to_end(key)
+            while len(self.values) > self.limit:
+                self.values.popitem(last=False)
+
+
 def person_text(payload):
     person = (payload or {}).get("person") or {}
     if not person:
@@ -526,88 +635,250 @@ def machine_card(snapshot, reference):
     )
 
 
-def idle_gpu_text(snapshot):
+def normalized_gpu_count(value):
+    if value in (None, ""):
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    return count if 1 <= count <= 16 else None
+
+
+def machine_type_label(count):
+    return {1: "普通机器", 4: "四卡机", 8: "八卡机"}.get(int(count), "%d卡机" % int(count))
+
+
+def normalized_resource_filters(value=None):
+    source = value if isinstance(value, dict) else {"gpu_count": value}
+    try:
+        min_free = float(source.get("min_free_gpu_memory_gb"))
+        min_free = min(max(min_free, 0), 640)
+        if min_free <= 0:
+            min_free = None
+    except (TypeError, ValueError):
+        min_free = None
+    idle_value = source.get("idle_only")
+    idle_only = idle_value is True or str(idle_value).strip().lower() in ("1", "true", "yes")
+    return {
+        "gpu_count": normalized_gpu_count(source.get("gpu_count")),
+        "group": " ".join(str(source.get("group") or "").strip().split())[:80] or None,
+        "idle_only": idle_only,
+        "min_free_gpu_memory_gb": min_free,
+        "gpu_model": " ".join(str(source.get("gpu_model") or "").strip().split())[:80] or None,
+    }
+
+
+def snapshot_inventory(snapshot):
+    counts = OrderedDict()
+    groups = OrderedDict()
+    for result in snapshot.get("results") or []:
+        if result.get("status") != "online":
+            continue
+        devices = ((((result.get("metrics") or {}).get("gpu") or {}).get("devices")) or [])
+        if not devices:
+            continue
+        counts[len(devices)] = counts.get(len(devices), 0) + 1
+        group = str(result.get("group") or "未分组")[:80]
+        groups[group] = groups.get(group, 0) + 1
+    return {
+        "machine_types": [
+            {"gpu_count": count, "label": machine_type_label(count), "online_machines": amount}
+            for count, amount in sorted(counts.items())
+        ],
+        "groups": [{"name": name, "online_gpu_machines": amount} for name, amount in groups.items()],
+    }
+
+
+def has_resource_filters(filters):
+    return any(
+        (
+            filters.get("gpu_count"),
+            filters.get("group"),
+            filters.get("idle_only"),
+            filters.get("min_free_gpu_memory_gb") is not None,
+            filters.get("gpu_model"),
+        )
+    )
+
+
+def gpu_machine_rows(snapshot, query=None):
+    filters = normalized_resource_filters(query)
+    expected_count = filters["gpu_count"]
+    min_free_bytes = (filters["min_free_gpu_memory_gb"] or 0) * 1024**3
+    group_query = str(filters["group"] or "").lower()
+    model_query = str(filters["gpu_model"] or "").lower()
     rows = []
     for result in snapshot.get("results") or []:
         if result.get("status") != "online":
             continue
-        for device in ((((result.get("metrics") or {}).get("gpu") or {}).get("devices")) or []):
+        metrics = result.get("metrics") or {}
+        devices = (((metrics.get("gpu") or {}).get("devices")) or [])
+        if not devices or (expected_count and len(devices) != expected_count):
+            continue
+        if group_query and group_query not in str(result.get("group") or "").lower():
+            continue
+        device_rows = []
+        for device in devices:
             total = as_number(device.get("memory_total_bytes"))
             used = as_number(device.get("memory_used_bytes"))
-            rows.append(
+            util = as_number(device.get("utilization_percent"))
+            free = max(total - used, 0)
+            idle = util <= 10 and (total <= 0 or used / total <= 0.10)
+            model_matches = not model_query or model_query in str(device.get("name") or "").lower()
+            capacity_matches = not min_free_bytes or free >= min_free_bytes
+            idle_matches = not filters["idle_only"] or idle
+            device_rows.append(
                 {
-                    "server": result.get("name") or result.get("id"),
-                    "host": result.get("host"),
                     "index": device.get("index"),
                     "name": device.get("name") or "GPU",
-                    "free": max(total - used, 0),
+                    "free": free,
                     "total": total,
-                    "util": as_number(device.get("utilization_percent")),
+                    "util": util,
+                    "idle": idle,
+                    "matches": model_matches and capacity_matches and idle_matches,
                 }
             )
-    rows.sort(key=lambda item: (item["free"], -item["util"]), reverse=True)
+        matching_count = sum(1 for device in device_rows if device["matches"])
+        if has_resource_filters(filters) and not matching_count:
+            continue
+        rows.append(
+            {
+                "server": result.get("name") or result.get("id"),
+                "host": result.get("host") or "-",
+                "group": result.get("group") or "未分组",
+                "gpu_count": len(device_rows),
+                "idle_count": sum(1 for device in device_rows if device["idle"]),
+                "matching_count": matching_count,
+                "free": sum(device["free"] for device in device_rows),
+                "total": sum(device["total"] for device in device_rows),
+                "cpu": (metrics.get("cpu") or {}).get("percent"),
+                "memory": (metrics.get("memory") or {}).get("percent"),
+                "devices": device_rows,
+            }
+        )
+    rows.sort(key=lambda item: (-item["matching_count"], -item["idle_count"], -item["free"], item["server"]))
+    return rows
+
+
+def resource_filter_description(filters):
+    parts = []
+    if filters.get("gpu_count"):
+        parts.append(machine_type_label(filters["gpu_count"]))
+    if filters.get("group"):
+        parts.append(filters["group"])
+    if filters.get("gpu_model"):
+        parts.append("型号含 %s" % filters["gpu_model"])
+    if filters.get("idle_only"):
+        parts.append("当前空闲")
+    if filters.get("min_free_gpu_memory_gb") is not None:
+        parts.append("单卡可用显存至少 %g GB" % filters["min_free_gpu_memory_gb"])
+    return " · ".join(parts) or "全部在线 GPU 机器"
+
+
+def idle_gpu_text(snapshot, query=None):
+    filters = normalized_resource_filters(query)
+    rows = gpu_machine_rows(snapshot, filters)
     if not rows:
-        return "当前没有可用的 GPU 数据。"
-    lines = ["空闲 GPU（按可用显存排序）："]
-    for row in rows[:15]:
+        return "当前没有符合以下条件的机器：%s。" % resource_filter_description(filters)
+    if not has_resource_filters(filters):
+        groups = OrderedDict()
+        for row in sorted(rows, key=lambda item: (item["gpu_count"] not in (1, 4, 8), item["gpu_count"], item["server"])):
+            groups.setdefault(row["gpu_count"], []).append(row)
+        lines = ["空闲机器概览："]
+        for count, machines in groups.items():
+            idle = sum(item["idle_count"] for item in machines)
+            total = sum(item["gpu_count"] for item in machines)
+            lines.append("%s：%d 台，空闲 %d/%d 张卡" % (machine_type_label(count), len(machines), idle, total))
+        lines.append("回复“那四卡机呢”可查看具体机器和每张卡。")
+        return "\n".join(lines)[:3900]
+    lines = ["资源匹配：%s" % resource_filter_description(filters)]
+    for row in rows:
         lines.append(
-            "%s · GPU %s · %s\n空闲 %s / %s · 算力 %s"
+            "%s\n符合 %d/%d 张卡 · 空闲 %d/%d · 可用显存 %s · CPU %s · 内存 %s"
             % (
                 row["server"],
-                row["index"],
-                row["name"],
+                row["matching_count"],
+                row["gpu_count"],
+                row["idle_count"],
+                row["gpu_count"],
                 format_bytes(row["free"]),
-                format_bytes(row["total"]),
-                format_percent(row["util"]),
+                format_percent(row["cpu"]),
+                format_percent(row["memory"]),
             )
         )
     return "\n\n".join(lines)[:3900]
 
 
-def idle_gpu_card(snapshot):
-    rows = []
-    for result in snapshot.get("results") or []:
-        if result.get("status") != "online":
-            continue
-        for device in ((((result.get("metrics") or {}).get("gpu") or {}).get("devices")) or []):
-            total = as_number(device.get("memory_total_bytes"))
-            used = as_number(device.get("memory_used_bytes"))
-            rows.append(
+def idle_gpu_card(snapshot, query=None):
+    filters = normalized_resource_filters(query)
+    rows = gpu_machine_rows(snapshot, filters)
+    if not rows:
+        return compact_card(
+            "机器资源匹配",
+            "当前没有符合以下条件的机器：**%s**。" % resource_filter_description(filters),
+            template="grey",
+        )
+
+    if not has_resource_filters(filters):
+        groups = OrderedDict()
+        ordered = sorted(rows, key=lambda item: (item["gpu_count"] not in (1, 4, 8), item["gpu_count"], item["server"]))
+        for row in ordered:
+            groups.setdefault(row["gpu_count"], []).append(row)
+        sections = []
+        for count, machines in groups.items():
+            idle = sum(item["idle_count"] for item in machines)
+            total = sum(item["gpu_count"] for item in machines)
+            content = []
+            for row in machines:
+                content.append(
+                    "- **%s** · 空闲 **%d/%d** · 可用显存 **%s**"
+                    % (row["server"], row["idle_count"], row["gpu_count"], format_bytes(row["free"]))
+                )
+            sections.append(
                 {
-                    "server": result.get("name") or result.get("id"),
-                    "index": device.get("index"),
-                    "name": device.get("name") or "GPU",
-                    "free": max(total - used, 0),
-                    "total": total,
-                    "util": as_number(device.get("utilization_percent")),
+                    "title": "%s · %d 台 · 空闲 %d/%d" % (machine_type_label(count), len(machines), idle, total),
+                    "content": "\n".join(content),
                 }
             )
-    rows.sort(key=lambda item: (item["free"], -item["util"]), reverse=True)
-    if not rows:
-        return compact_card("空闲 GPU", "当前没有可用的 GPU 数据。", template="grey")
-    groups = OrderedDict()
-    for row in rows[:30]:
-        groups.setdefault(row["server"], []).append(row)
+        return compact_card(
+            "空闲机器概览",
+            "共 **%d** 台在线 GPU 机器。展开类型查看机器；回复“那四卡机呢”可看逐卡详情。" % len(rows),
+            sections,
+            template="green",
+        )
+
+    matching_devices = sum(row["matching_count"] for row in rows)
     sections = []
-    for server, devices in groups.items():
-        content = []
-        for row in devices:
+    for row in rows:
+        content = [
+            "%s · `%s`\nCPU **%s** · 内存 **%s**"
+            % (row["group"], row["host"], format_percent(row["cpu"]), format_percent(row["memory"]))
+        ]
+        for device in sorted(row["devices"], key=lambda item: (not item["matches"], item["index"])):
             content.append(
-                "- GPU %s · %s\n  空闲 **%s / %s** · 算力 %s"
+                "- GPU %s · **%s** · %s\n  可用 **%s / %s** · 算力 %s"
                 % (
-                    row["index"],
-                    row["name"],
-                    format_bytes(row["free"]),
-                    format_bytes(row["total"]),
-                    format_percent(row["util"]),
+                    device["index"],
+                    "符合" if device["matches"] else ("空闲" if device["idle"] else "占用"),
+                    device["name"],
+                    format_bytes(device["free"]),
+                    format_bytes(device["total"]),
+                    format_percent(device["util"]),
                 )
             )
-        sections.append({"title": "%s · %d 张" % (server, len(devices)), "content": "\n".join(content)})
+        sections.append(
+            {
+                "title": "%s · 符合 %d/%d" % (row["server"], row["matching_count"], row["gpu_count"]),
+                "content": "\n".join(content),
+            }
+        )
     return compact_card(
-        "空闲 GPU",
-        "共 **%d** 张 GPU，已按可用显存排序；点击机器展开。" % len(rows),
-        sections[:12],
-        template="green",
+        "机器资源匹配",
+        "条件：**%s**\n找到 **%d** 台机器、**%d** 张符合条件的 GPU；点击机器查看每张卡。"
+        % (resource_filter_description(filters), len(rows), matching_devices),
+        sections,
+        template="green" if matching_devices else "orange",
     )
 
 
@@ -791,6 +1062,7 @@ class FeishuResourceBot:
         self.dashboard = dashboard_api
         self.workflow = FeishuWorkflowStore(dashboard_api.store)
         self.deduplicator = MessageDeduplicator()
+        self.context = ConversationMemory()
         self.admin_open_ids = {
             value.strip() for value in os.getenv("FEISHU_ADMIN_OPEN_IDS", "").split(",") if value.strip()
         }
@@ -1066,9 +1338,24 @@ class FeishuResourceBot:
         if not self.deduplicator.accept(message_id):
             return
         sender_id = getattr(getattr(data.event.sender, "sender_id", None), "open_id", "")
+        chat_id = getattr(message, "chat_id", "")
         print("message received sender_open_id=%s" % (sender_id or "unknown"), flush=True)
         try:
-            command, argument = self.router.route(self.event_text(data))
+            context_key = (sender_id, chat_id)
+            user_text = self.event_text(data)
+            try:
+                snapshot = self.dashboard.snapshot()
+            except Exception:
+                snapshot = {}
+            plan = self.router.plan(
+                user_text,
+                previous=self.context.get(context_key),
+                inventory=snapshot_inventory(snapshot),
+            )
+            command = plan.get("intent") or "help"
+            argument = plan.get("argument") or ""
+            if command in ("person", "machine", "idle_gpu"):
+                self.context.remember(context_key, user_text, plan)
             card = None
             if command == "person":
                 if not argument:
@@ -1079,13 +1366,14 @@ class FeishuResourceBot:
                     answer = person_text(payload)
                     card = person_card(payload)
             elif command == "machine":
-                snapshot = self.dashboard.snapshot()
+                snapshot = snapshot or self.dashboard.snapshot()
                 answer = machine_text(snapshot, argument)
                 card = machine_card(snapshot, argument)
             elif command == "idle_gpu":
-                snapshot = self.dashboard.snapshot()
-                answer = idle_gpu_text(snapshot)
-                card = idle_gpu_card(snapshot)
+                snapshot = snapshot or self.dashboard.snapshot()
+                filters = plan.get("filters") or {}
+                answer = idle_gpu_text(snapshot, filters)
+                card = idle_gpu_card(snapshot, filters)
             elif command == "request_account":
                 answer = "请在卡片中填写账号申请。"
                 card = account_form_card(self.dashboard.machines(), direct=False)
@@ -1107,6 +1395,9 @@ class FeishuResourceBot:
             elif command == "admin_disabled":
                 answer = "该写操作尚未开放，请使用“申请账号”“待审批”或“开通账号”。"
                 card = compact_card("操作尚未开放", answer, template="orange")
+            elif command == "clarify":
+                answer = plan.get("clarification") or "请再补充一下要查询的人、机器或资源条件。"
+                card = compact_card("需要确认", answer, template="orange")
             else:
                 answer = HELP_TEXT
                 card = compact_card("设备资源助手", HELP_TEXT, template="blue")

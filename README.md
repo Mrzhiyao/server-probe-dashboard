@@ -68,9 +68,9 @@ When reverse-proxied, the application only accepts `X-Real-IP` from a loopback p
 
 ## Feishu Query Bot
 
-The optional enterprise self-built bot uses Feishu's long-connection SDK and does not require a public event callback. Store `FEISHU_APP_ID` and `FEISHU_APP_SECRET` only in the server environment file. The first release supports read-only commands such as `查人 崔涵帅`, `查机 gpu010`, and `空闲GPU`; provisioning and approval commands remain disabled until administrator identity rules are configured.
+The optional enterprise self-built bot uses Feishu's long-connection SDK and does not require a public callback URL. Store `FEISHU_APP_ID` and `FEISHU_APP_SECRET` only in the server environment file. It supports resource queries, account-request forms, administrator approval cards, and guarded direct provisioning. Set `FEISHU_ADMIN_OPEN_IDS` before enabling approval or provisioning actions; the backend still enforces administrator identity and account-operation permissions for every callback.
 
-Set `FEISHU_BOT_LLM_BASE_URL`, `FEISHU_BOT_LLM_API_KEY`, and `FEISHU_BOT_LLM_MODEL` to enable an optional OpenAI-compatible intent classifier. Deterministic commands are matched locally first; only unmatched text is sent to the model. The model can select a read-only intent from a strict allowlist and can never execute provisioning, approval, deletion, or password operations.
+Set `FEISHU_BOT_LLM_BASE_URL`, `FEISHU_BOT_LLM_API_KEY`, and `FEISHU_BOT_LLM_MODEL` to enable the optional OpenAI-compatible query planner. When enabled, the model interprets natural-language queries and short follow-ups, then produces a validated tool plan with filters such as machine group, GPU count, minimum free GPU memory, and idle status. The model receives the user's current text, the previous query plan, and a compact inventory of group/type counts; live metrics, passwords, approval records, and SSH credentials are not sent to it. Live results are always calculated locally and rendered from the dashboard snapshot. Destructive or privileged operations remain protected by fixed backend allowlists and role checks.
 
 Run it separately from the dashboard HTTP service using `systemd/server-probe-feishu-bot.service` so connection failures and restarts do not affect metric collection.
 
