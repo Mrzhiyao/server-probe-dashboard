@@ -63,6 +63,7 @@ python -m server_probe.auth set-password alice --role user --display-name "Alice
 ```
 
 Use HTTPS in front of the dashboard when exposing it beyond a trusted LAN.
+When reverse-proxied, the application only accepts `X-Real-IP` from a loopback peer; direct clients cannot override the address used by login rate limiting.
 
 ## Persistent History
 

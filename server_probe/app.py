@@ -3,6 +3,7 @@
 
 import argparse
 import http.cookies
+import ipaddress
 import json
 import mimetypes
 import os
@@ -77,6 +78,21 @@ def value_bool(value, default=False):
     if isinstance(value, (int, float)):
         return bool(value)
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def request_client_ip(peer_address, real_ip_header=""):
+    peer = str(peer_address or "").strip()
+    try:
+        trusted_proxy = ipaddress.ip_address(peer).is_loopback
+    except ValueError:
+        trusted_proxy = False
+    if trusted_proxy:
+        candidate = str(real_ip_header or "").strip()
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            pass
+    return peer
 
 
 def public_server(server):
@@ -1554,8 +1570,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return False
 
     def client_ip(self):
-        forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
-        return forwarded or self.client_address[0]
+        return request_client_ip(self.client_address[0], self.headers.get("X-Real-IP", ""))
 
     def login_key(self, username):
         return "%s:%s" % (self.client_ip(), (username or "").strip().lower())
