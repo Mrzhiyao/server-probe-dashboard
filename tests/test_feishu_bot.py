@@ -9,6 +9,7 @@ from server_probe.feishu_bot import (
     combine_cards,
     compact_card,
     idle_gpu_card,
+    machine_catalog_card,
     parse_command,
     pending_requests_card,
     snapshot_inventory,
@@ -183,11 +184,28 @@ class FeishuCommandTests(unittest.TestCase):
         snapshot = {"results": [machine("four-gpu", 4), machine("eight-gpu", 8)]}
         inventory = snapshot_inventory(snapshot)
         self.assertEqual([item["gpu_count"] for item in inventory["machine_types"]], [4, 8])
+        self.assertEqual(inventory["machines"][1]["name"], "eight-gpu")
         card = idle_gpu_card(snapshot, {"gpu_count": 4, "idle_only": True})
         raw = json.dumps(card, ensure_ascii=False)
         self.assertIn("four-gpu", raw)
         self.assertNotIn("eight-gpu", raw)
         self.assertIn("四卡机", raw)
+        catalog = json.dumps(machine_catalog_card(snapshot, {"gpu_count": 8}), ensure_ascii=False)
+        self.assertIn("八卡机", catalog)
+        self.assertIn("eight-gpu", catalog)
+        self.assertNotIn("four-gpu", catalog)
+
+    def test_catalog_action_is_grounded_in_inventory_filters(self):
+        router = LLMIntentRouter()
+        plan = router.normalize_action(
+            {
+                "intent": "machine_catalog",
+                "filters": {"gpu_count": 8, "idle_only": True, "min_free_gpu_memory_gb": 40},
+            }
+        )
+        self.assertEqual(plan["filters"]["gpu_count"], 8)
+        self.assertFalse(plan["filters"]["idle_only"])
+        self.assertIsNone(plan["filters"]["min_free_gpu_memory_gb"])
 
     def test_account_form_and_approval_cards_use_callbacks(self):
         machines = [{"id": "gpu010", "name": "GPU10", "host": "192.0.2.10"}]

@@ -33,6 +33,7 @@ ALLOWED_INTENTS = {
     "idle_gpu",
     "person",
     "machine",
+    "machine_catalog",
     "top_users",
     "request_account",
     "pending_requests",
@@ -183,23 +184,28 @@ class LLMIntentRouter:
             "你是设备资源助手的工具规划器，负责理解自然中文、连续追问和一句话中的多个独立问题。"
             "只输出一个 JSON 对象，不要解释；格式是 {\"actions\":[...]}，按用户提问顺序最多输出 3 个动作。"
             "可选 intent：idle_gpu、person、machine、request_account、pending_requests、provision_account、"
-            "top_users、admin_disabled、help、clarify、chat。"
+            "machine_catalog、top_users、admin_disabled、help、clarify、chat。"
             "idle_gpu 用于查询机器清单、空闲机器、GPU 容量或按条件找机器。filters 可包含："
             "gpu_count（每台机器的 GPU 张数，整数或 null）、group（机器组或 null）、idle_only（布尔值）、"
             "min_free_gpu_memory_gb（要求单卡至少多少 GB 空闲显存或 null）、gpu_model（型号关键词或 null）。"
             "person 查询某个人或账号，argument 填姓名/账号；machine 查询一台明确机器，argument 填名称/IP。"
+            "machine_catalog 用于解释单卡机/四卡机/八卡机等设备类别，或查询某类设备对应哪些实际机器；"
+            "filters 可使用 gpu_count、group、gpu_model，但不要设置 idle_only 或显存阈值。"
             "top_users 查询本小时资源使用较高的用户；filters.limit 是 1 到 15，filters.resource 可为 all、gpu、memory、machines。"
             "request_account 是普通用户提交申请；pending_requests 是管理员看待审批；provision_account 是管理员主动开账号。"
             "删除账号、改密码、直接批准等未开放写操作用 admin_disabled。真正不明确时用 clarify，clarification 给一句具体追问。"
             "chat 只用于问候、反馈和解释上一轮对话，response 给不超过 100 字的简短回复；chat 不得声称任何实时资源事实。"
             "结合 previous 理解‘那四卡机呢’‘它呢’等追问，并继承仍然适用的条件。"
             "inventory 仅说明系统现有分组和 GPU 张数类型，不要臆造机器或资源数据。"
+            "inventory.machines 是脱敏设备目录，包含真实名称、类别和 GPU 型号；涉及现有机器类别或类别对应设备时，"
+            "必须使用 machine_catalog，不要退回 help/chat。"
             "每个动作格式为 {\"intent\":\"...\",\"argument\":\"\",\"filters\":{},\"clarification\":\"\"}。"
             "示例：‘查空闲机器吧，四卡机的呢’输出 "
             "{\"actions\":[{\"intent\":\"idle_gpu\",\"argument\":\"\",\"filters\":{\"gpu_count\":4,"
             "\"group\":null,\"idle_only\":true,\"min_free_gpu_memory_gb\":null,\"gpu_model\":null},"
             "\"clarification\":\"\"}]}。"
             "示例：‘你还会啥？有哪些用户最近使用机器量很大’必须拆成两个动作：help 和 top_users，不能忽略后一个问题。"
+            "示例：‘你知道八卡机是啥吗’输出 machine_catalog，filters.gpu_count=8；后端会回答当前对应机器。"
             "如果 previous 显示上一句包含多个动作，而用户问‘为什么第二个没回复’，用 chat 并在 response 中说明看到的动作。"
         )
         body = {
@@ -258,6 +264,10 @@ class LLMIntentRouter:
         filters = action.get("filters") if isinstance(action.get("filters"), dict) else {}
         if intent == "idle_gpu":
             normalized_filters = normalized_resource_filters(filters)
+        elif intent == "machine_catalog":
+            normalized_filters = normalized_resource_filters(filters)
+            normalized_filters["idle_only"] = False
+            normalized_filters["min_free_gpu_memory_gb"] = None
         elif intent == "top_users":
             normalized_filters = normalized_top_user_filters(filters)
         else:
@@ -688,8 +698,11 @@ class ConversationMemory:
         for plan in (plans or [])[:3]:
             intent = str(plan.get("intent") or "help")
             filters = plan.get("filters") or {}
-            if intent == "idle_gpu":
+            if intent in ("idle_gpu", "machine_catalog"):
                 filters = normalized_resource_filters(filters)
+                if intent == "machine_catalog":
+                    filters["idle_only"] = False
+                    filters["min_free_gpu_memory_gb"] = None
             elif intent == "top_users":
                 filters = normalized_top_user_filters(filters)
             else:
@@ -871,6 +884,7 @@ def normalized_resource_filters(value=None):
 def snapshot_inventory(snapshot):
     counts = OrderedDict()
     groups = OrderedDict()
+    machines = []
     for result in snapshot.get("results") or []:
         if result.get("status") != "online":
             continue
@@ -880,12 +894,23 @@ def snapshot_inventory(snapshot):
         counts[len(devices)] = counts.get(len(devices), 0) + 1
         group = str(result.get("group") or "未分组")[:80]
         groups[group] = groups.get(group, 0) + 1
+        models = sorted({str(device.get("name") or "GPU")[:100] for device in devices})
+        machines.append(
+            {
+                "id": str(result.get("id") or "")[:100],
+                "name": str(result.get("name") or result.get("id") or "")[:140],
+                "group": group,
+                "gpu_count": len(devices),
+                "gpu_models": models,
+            }
+        )
     return {
         "machine_types": [
             {"gpu_count": count, "label": machine_type_label(count), "online_machines": amount}
             for count, amount in sorted(counts.items())
         ],
         "groups": [{"name": name, "online_gpu_machines": amount} for name, amount in groups.items()],
+        "machines": machines[:60],
     }
 
 
@@ -958,6 +983,76 @@ def gpu_machine_rows(snapshot, query=None):
         )
     rows.sort(key=lambda item: (-item["matching_count"], -item["idle_count"], -item["free"], item["server"]))
     return rows
+
+
+def machine_catalog_text(snapshot, query=None):
+    filters = normalized_resource_filters(query)
+    filters["idle_only"] = False
+    filters["min_free_gpu_memory_gb"] = None
+    rows = gpu_machine_rows(snapshot, filters)
+    if not rows:
+        return "当前设备目录中没有符合条件的在线机器。"
+    count = filters.get("gpu_count")
+    if count:
+        lines = ["%s是指单台机器配置 %d 张 GPU；当前有 %d 台：" % (machine_type_label(count), count, len(rows))]
+    else:
+        lines = ["当前在线 GPU 设备目录："]
+    for row in rows[:20]:
+        models = "、".join(sorted({device.get("name") or "GPU" for device in row.get("devices") or []}))
+        lines.append("%s · %s · %d 张 %s" % (row["server"], row["group"], row["gpu_count"], models))
+    return "\n".join(lines)[:3900]
+
+
+def machine_catalog_card(snapshot, query=None):
+    filters = normalized_resource_filters(query)
+    filters["idle_only"] = False
+    filters["min_free_gpu_memory_gb"] = None
+    rows = gpu_machine_rows(snapshot, filters)
+    count = filters.get("gpu_count")
+    label = machine_type_label(count) if count else "GPU 设备"
+    if not rows:
+        return compact_card("设备目录 · %s" % label, "当前没有符合条件的在线机器。", template="grey")
+    if not has_resource_filters(filters):
+        groups = OrderedDict()
+        for row in sorted(rows, key=lambda item: (item["gpu_count"], item["server"])):
+            groups.setdefault(row["gpu_count"], []).append(row)
+        sections = []
+        for gpu_count, machines in groups.items():
+            sections.append(
+                {
+                    "title": "%s · %d 台" % (machine_type_label(gpu_count), len(machines)),
+                    "content": "\n".join("- **%s** · %s" % (row["server"], row["group"]) for row in machines),
+                }
+            )
+        return compact_card(
+            "GPU 设备目录",
+            "当前在线 **%d** 台 GPU 机器，按单机 GPU 张数分类。" % len(rows),
+            sections,
+            template="blue",
+        )
+    sections = []
+    for row in rows:
+        models = "、".join(sorted({device.get("name") or "GPU" for device in row.get("devices") or []}))
+        content = (
+            "%s · `%s`\n配置 **%d 张 %s**\n当前空闲 **%d/%d** 张 · 总可用显存 **%s**"
+            % (
+                row["group"],
+                row["host"],
+                row["gpu_count"],
+                models,
+                row["idle_count"],
+                row["gpu_count"],
+                format_bytes(row["free"]),
+            )
+        )
+        sections.append({"title": row["server"], "content": content})
+    definition = (
+        "**%s**是指单台机器配置 **%d 张 GPU**。当前设备目录中对应 **%d 台**机器。"
+        % (label, count, len(rows))
+        if count
+        else "当前设备目录中找到 **%d 台**符合条件的机器。" % len(rows)
+    )
+    return compact_card("设备目录 · %s" % label, definition, sections, template="blue")
 
 
 def resource_filter_description(filters):
@@ -1543,6 +1638,10 @@ class FeishuResourceBot:
         if command == "machine":
             snapshot = snapshot or self.dashboard.snapshot()
             return machine_text(snapshot, argument), machine_card(snapshot, argument)
+        if command == "machine_catalog":
+            snapshot = snapshot or self.dashboard.snapshot()
+            filters = plan.get("filters") or {}
+            return machine_catalog_text(snapshot, filters), machine_catalog_card(snapshot, filters)
         if command == "idle_gpu":
             snapshot = snapshot or self.dashboard.snapshot()
             filters = plan.get("filters") or {}
