@@ -186,6 +186,10 @@ class HourlyUsageReporterTests(unittest.TestCase):
         self.assertEqual(len(client.payloads), 1)
         payload = client.payloads[0]
         self.assertEqual(payload["card"]["header"]["title"]["content"], "每小时用户资源概览")
+        self.assertEqual(payload["card"]["schema"], "2.0")
+        self.assertTrue(
+            any(element.get("tag") == "collapsible_panel" for element in payload["card"]["body"]["elements"])
+        )
         rendered = str(payload)
         self.assertIn("alice", rendered)
         self.assertIn("bob", rendered)

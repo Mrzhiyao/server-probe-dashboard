@@ -561,29 +561,26 @@ class HourlyUsageReporter:
                     ]
                 )
                 machine_blocks.append("\n".join(machine_lines))
+            panel_title = display_name or (person.get("usernames") or ["未登记用户"])[0]
+            panel_title += " · %d 台" % int(person.get("machine_count") or 0)
+            if person.get("gpu_memory_peak_bytes"):
+                panel_title += " · 显存 %s" % format_bytes(person.get("gpu_memory_peak_bytes"))
             return {
-                "tag": "column_set",
-                "flex_mode": "none",
-                "background_style": "grey",
-                "columns": [
+                "tag": "collapsible_panel",
+                "expanded": False,
+                "header": {
+                    "title": {"tag": "plain_text", "content": panel_title[:120]},
+                    "icon": {"tag": "standard_icon", "token": "down-small-ccm_outlined", "size": "16px 16px"},
+                    "icon_position": "right",
+                    "icon_expanded_angle": -180,
+                },
+                "border": {"color": "grey", "corner_radius": "5px"},
+                "elements": [
                     {
-                        "tag": "column",
-                        "width": "weighted",
-                        "weight": 3,
-                        "vertical_align": "top",
-                        "elements": [
-                            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(left_lines)}}
-                        ],
-                    },
-                    {
-                        "tag": "column",
-                        "width": "weighted",
-                        "weight": 5,
-                        "vertical_align": "top",
-                        "elements": [
-                            {"tag": "div", "text": {"tag": "lark_md", "content": "\n\n".join(machine_blocks)}}
-                        ],
-                    },
+                        "tag": "markdown",
+                        "content": ("\n".join(left_lines) + "\n\n" + "\n\n".join(machine_blocks))[:5000],
+                        "text_size": "normal",
+                    }
                 ],
             }
 
@@ -675,39 +672,35 @@ class HourlyUsageReporter:
             )
         elements.append(
             {
-                "tag": "note",
-                "elements": [
-                    {
-                        "tag": "plain_text",
-                        "content": "姓名已匹配 %d 人；账号名保留用于核对。不含 root 和系统账号，容器按可识别归属用户合并。"
-                        % len(known_names),
-                    }
-                ],
+                "tag": "markdown",
+                "content": "<font color='grey'>姓名已匹配 %d 人；账号名保留用于核对。不含 root 和系统账号，容器按可识别归属用户合并。</font>"
+                % len(known_names),
+                "text_size": "notation",
             }
         )
         if self.dashboard_url:
             elements.append(
                 {
-                    "tag": "action",
-                    "actions": [
-                        {
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": "打开监控面板"},
-                            "url": self.dashboard_url,
-                            "type": "primary",
-                        }
-                    ],
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "打开监控面板"},
+                    "type": "primary",
+                    "behaviors": [{"type": "open_url", "default_url": self.dashboard_url}],
                 }
             )
         return {
             "msg_type": "interactive",
             "card": {
-                "config": {"wide_screen_mode": True},
+                "schema": "2.0",
+                "config": {"width_mode": "fill", "enable_forward": True},
                 "header": {
                     "template": "turquoise",
                     "title": {"tag": "plain_text", "content": "每小时用户资源概览"},
                 },
-                "elements": elements,
+                "body": {
+                    "direction": "vertical",
+                    "padding": "12px 12px 12px 12px",
+                    "elements": elements,
+                },
             },
         }
 

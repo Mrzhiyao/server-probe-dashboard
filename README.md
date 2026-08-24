@@ -70,6 +70,8 @@ When reverse-proxied, the application only accepts `X-Real-IP` from a loopback p
 
 The optional enterprise self-built bot uses Feishu's long-connection SDK and does not require a public event callback. Store `FEISHU_APP_ID` and `FEISHU_APP_SECRET` only in the server environment file. The first release supports read-only commands such as `查人 崔涵帅`, `查机 gpu010`, and `空闲GPU`; provisioning and approval commands remain disabled until administrator identity rules are configured.
 
+Set `FEISHU_BOT_LLM_BASE_URL`, `FEISHU_BOT_LLM_API_KEY`, and `FEISHU_BOT_LLM_MODEL` to enable an optional OpenAI-compatible intent classifier. Deterministic commands are matched locally first; only unmatched text is sent to the model. The model can select a read-only intent from a strict allowlist and can never execute provisioning, approval, deletion, or password operations.
+
 Run it separately from the dashboard HTTP service using `systemd/server-probe-feishu-bot.service` so connection failures and restarts do not affect metric collection.
 
 ## Persistent History
