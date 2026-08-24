@@ -1,0 +1,22 @@
+[Unit]
+Description=Server Probe Feishu Query Bot
+After=network-online.target server-probe-dashboard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/server-probe-dashboard
+EnvironmentFile=/opt/server-probe-dashboard/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/server-probe-dashboard/.venv/bin/python -m server_probe.feishu_bot
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

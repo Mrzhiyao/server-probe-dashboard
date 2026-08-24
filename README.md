@@ -13,6 +13,7 @@ A lightweight SSH-based Linux resource dashboard. The dashboard host periodicall
 - Optional Feishu webhook notifications with alert confirmation, cooldown reminders, and recovery messages
 - Optional hourly Feishu summaries of ordinary-user CPU, memory, GPU memory, top GPU processes, and attributed containers
 - Authenticated per-person drill-down pages linked from Feishu cards
+- Optional Feishu WebSocket bot for read-only person, machine, and idle-GPU queries
 - Optional PostgreSQL metric history with restart recovery, 24-hour, 7-day, and 30-day downsampled views
 - Top CPU, memory, and GPU process tables
 - NVIDIA GPU metrics through `nvidia-smi`
@@ -64,6 +65,12 @@ python -m server_probe.auth set-password alice --role user --display-name "Alice
 
 Use HTTPS in front of the dashboard when exposing it beyond a trusted LAN.
 When reverse-proxied, the application only accepts `X-Real-IP` from a loopback peer; direct clients cannot override the address used by login rate limiting.
+
+## Feishu Query Bot
+
+The optional enterprise self-built bot uses Feishu's long-connection SDK and does not require a public event callback. Store `FEISHU_APP_ID` and `FEISHU_APP_SECRET` only in the server environment file. The first release supports read-only commands such as `查人 崔涵帅`, `查机 gpu010`, and `空闲GPU`; provisioning and approval commands remain disabled until administrator identity rules are configured.
+
+Run it separately from the dashboard HTTP service using `systemd/server-probe-feishu-bot.service` so connection failures and restarts do not affect metric collection.
 
 ## Persistent History
 
