@@ -27,7 +27,7 @@ import paramiko
 from server_probe.auth import AuthStore, utc_now
 from server_probe.history import HistoryStore
 from server_probe.notifications import AlertNotificationManager, FeishuWebhookClient
-from server_probe.usage_reports import HourlyUsageReporter, current_user_usage, group_usage_rows
+from server_probe.usage_reports import HourlyUsageReporter, current_user_usage, group_usage_rows, rank_usage_people
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -596,14 +596,11 @@ class Monitor:
             return {"enabled": False}
         return self.usage_reporter.status()
 
-    def user_usage_details(self, person_ref, identities=None):
-        person_ref = str(person_ref or "").strip()
-        if not person_ref:
-            return None
+    def current_usage_rows(self):
         with self.snapshot_lock:
             snapshot = self.latest_snapshot
         if not snapshot:
-            return None
+            return None, []
         machines = current_user_usage(snapshot, ["root", "nobody"])
         rows = []
         for machine in machines:
@@ -626,6 +623,15 @@ class Monitor:
                     }
                 )
                 rows.append(row)
+        return snapshot, rows
+
+    def user_usage_details(self, person_ref, identities=None):
+        person_ref = str(person_ref or "").strip()
+        if not person_ref:
+            return None
+        snapshot, rows = self.current_usage_rows()
+        if not snapshot:
+            return None
         identity_map = {str(key).lower(): value for key, value in (identities or {}).items()}
         people = group_usage_rows(rows, identity_map)
         query = person_ref.casefold()
@@ -642,6 +648,42 @@ class Monitor:
                 "person": payload,
             }
         return None
+
+    def user_usage_ranking(self, identities=None, limit=10):
+        if self.usage_reporter is not None:
+            payload = self.usage_reporter.ranking_payload(identities or {}, limit=limit)
+            if payload.get("sample_count"):
+                return payload
+        snapshot, rows = self.current_usage_rows()
+        if not snapshot:
+            return None
+        results = [result for result in snapshot.get("results") or [] if result.get("status") == "online"]
+        memory_capacity = sum(
+            int(as_number(((result.get("metrics") or {}).get("memory") or {}).get("total_bytes")) or 0)
+            for result in results
+        )
+        gpu_capacity = sum(
+            int(as_number(device.get("memory_total_bytes")) or 0)
+            for result in results
+            for device in ((((result.get("metrics") or {}).get("gpu") or {}).get("devices")) or [])
+        )
+        identity_map = {str(key).lower(): value for key, value in (identities or {}).items()}
+        active_users = len(group_usage_rows(rows, identity_map))
+        return {
+            "window": "最近一次采样",
+            "started_at": snapshot.get("generated_at"),
+            "generated_at": snapshot.get("generated_at"),
+            "sample_count": 1,
+            "active_users": active_users,
+            "people": rank_usage_people(
+                rows,
+                identity_map,
+                memory_capacity_bytes=memory_capacity,
+                gpu_memory_capacity_bytes=gpu_capacity,
+                active_machine_count=len(results),
+                limit=limit,
+            ),
+        }
 
     def empty_snapshot(self):
         return {
@@ -2187,6 +2229,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_redirect("/requests")
                 return
             self.send_file(STATIC_DIR / "index.html")
+            return
+
+        if route == "/api/user-usage-ranking":
+            if not self.require_dashboard_viewer(user):
+                return
+            try:
+                limit = max(1, min(int(query.get("limit", ["10"])[0]), 30))
+            except ValueError:
+                limit = 10
+            identities = self.auth_store.resource_identity_map() if self.auth_enabled else {}
+            payload = self.monitor.user_usage_ranking(identities, limit=limit)
+            if payload is None:
+                self.send_json({"error": "user resource ranking unavailable"}, status=503)
+                return
+            self.send_json(payload)
             return
 
         if route == "/api/user-usage":

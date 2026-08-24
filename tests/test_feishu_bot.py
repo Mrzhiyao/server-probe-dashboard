@@ -6,11 +6,13 @@ from server_probe.feishu_bot import (
     MessageDeduplicator,
     account_form_card,
     clean_command,
+    combine_cards,
     compact_card,
     idle_gpu_card,
     parse_command,
     pending_requests_card,
     snapshot_inventory,
+    top_users_card,
 )
 
 
@@ -118,6 +120,40 @@ class FeishuCommandTests(unittest.TestCase):
         self.assertEqual(plan["filters"]["min_free_gpu_memory_gb"], 20)
         self.assertEqual(requests[0]["previous"], previous)
 
+    def test_llm_preserves_multiple_questions_in_one_message(self):
+        def opener(request, timeout):
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "actions": [
+                                            {"intent": "help", "argument": "", "filters": {}},
+                                            {
+                                                "intent": "top_users",
+                                                "argument": "",
+                                                "filters": {"limit": 8, "resource": "all"},
+                                            },
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
+
+        router = LLMIntentRouter("https://newapi.example", "secret", "small-model", opener=opener)
+        plans = router.plans("你还会啥？有哪些用户最近使用机器量很大")
+        self.assertEqual([plan["intent"] for plan in plans], ["help", "top_users"])
+        self.assertEqual(plans[1]["filters"], {"limit": 8, "resource": "all"})
+        chat = router.normalize_action({"intent": "chat", "response": "我看到了上一条里的两个问题。"})
+        self.assertEqual(chat["intent"], "chat")
+        self.assertEqual(chat["clarification"], "我看到了上一条里的两个问题。")
+
     def test_resource_card_uses_model_filters_against_live_data_shape(self):
         def machine(name, count):
             return {
@@ -174,6 +210,34 @@ class FeishuCommandTests(unittest.TestCase):
         approval_raw = json.dumps(approval, ensure_ascii=False)
         self.assertIn("approve_request", approval_raw)
         self.assertIn("reject_request", approval_raw)
+
+    def test_top_user_card_can_be_combined_with_help(self):
+        ranking = top_users_card(
+            {
+                "window": "本小时至今",
+                "sample_count": 12,
+                "active_users": 3,
+                "people": [
+                    {
+                        "display_name": "Alice",
+                        "usernames": ["alice"],
+                        "machine_count": 2,
+                        "gpu_count": 3,
+                        "gpu_memory_peak_bytes": 20 * 1024**3,
+                        "memory_peak_bytes": 8 * 1024**3,
+                        "cpu_average_sum": 40,
+                        "resource_score": 72,
+                        "machine_rows": [],
+                    }
+                ],
+            }
+        )
+        card = combine_cards([compact_card("能力", "可以查询资源。"), ranking])
+        raw = json.dumps(card, ensure_ascii=False)
+        self.assertEqual(card["header"]["title"]["content"], "设备资源助手 · 2 项结果")
+        self.assertIn("Alice", raw)
+        self.assertIn("可以查询资源", raw)
+        self.assertIn("<font color=", raw)
 
 
 if __name__ == "__main__":

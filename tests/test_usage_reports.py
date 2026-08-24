@@ -211,6 +211,19 @@ class HourlyUsageReporterTests(unittest.TestCase):
         self.assertTrue(contains_cjk("周大智"))
         self.assertFalse(contains_cjk("student_t"))
 
+    def test_current_hour_ranking_groups_names_and_orders_heavy_users(self):
+        reporter = HourlyUsageReporter(RecordingClient(), interval_seconds=3600, now_fn=lambda: 1000.0)
+        self.assertFalse(reporter.process(self.snapshot()))
+        payload = reporter.ranking_payload(
+            {"alice": "Alice Chen", "bob": "Bob Li", "charlie": "Charlie Wu"},
+            limit=3,
+        )
+        self.assertEqual(payload["window"], "本小时至今")
+        self.assertEqual(payload["sample_count"], 1)
+        self.assertEqual(payload["people"][0]["display_name"], "Bob Li")
+        self.assertEqual(payload["people"][0]["gpu_memory_peak_bytes"], 4 * GIB)
+        self.assertGreater(payload["people"][0]["resource_score"], 0)
+
     def test_accounts_with_the_same_name_are_grouped_across_machines(self):
         rows = [
             {
@@ -249,6 +262,20 @@ class HourlyUsageReporterTests(unittest.TestCase):
         machine = payload["person"]["machine_rows"][0]
         self.assertEqual(machine["top_gpu_processes"][0]["pid"], 321)
         self.assertEqual(machine["top_gpu_process"]["process_name"], "python3")
+
+    def test_monitor_ranking_falls_back_to_latest_snapshot(self):
+        monitor = Monitor.__new__(Monitor)
+        monitor.latest_snapshot = self.snapshot()
+        monitor.snapshot_lock = threading.Lock()
+        monitor.refresh_seconds = 60
+        monitor.usage_reporter = None
+        payload = monitor.user_usage_ranking(
+            {"alice": "Alice Chen", "bob": "Bob Li", "charlie": "Charlie Wu"},
+            limit=2,
+        )
+        self.assertEqual(payload["window"], "最近一次采样")
+        self.assertEqual(len(payload["people"]), 2)
+        self.assertEqual(payload["people"][0]["display_name"], "Bob Li")
 
 
 if __name__ == "__main__":

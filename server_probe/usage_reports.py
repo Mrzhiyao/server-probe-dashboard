@@ -254,6 +254,54 @@ def group_usage_rows(rows, identities):
     return result
 
 
+def rank_usage_people(
+    rows,
+    identities,
+    memory_capacity_bytes=0,
+    gpu_memory_capacity_bytes=0,
+    active_machine_count=0,
+    limit=10,
+):
+    identity_map = {
+        str(username).strip().lower(): clean_text(display_name, 80)
+        for username, display_name in (identities or {}).items()
+        if str(username).strip() and clean_text(display_name, 80)
+    }
+    people = group_usage_rows(rows, identity_map)
+    memory_capacity = max(0, int(as_number(memory_capacity_bytes)))
+    gpu_capacity = max(0, int(as_number(gpu_memory_capacity_bytes)))
+    machine_capacity = max(1, int(as_number(active_machine_count)))
+    ranked = []
+    for person in people:
+        machine_rows = person.get("machine_rows") or []
+        gpu_slots = {
+            (row.get("server_id"), str(index))
+            for row in machine_rows
+            for index in (row.get("gpu_indices") or [])
+        }
+        person["gpu_count"] = len(gpu_slots)
+        person["cpu_average_sum"] = round(
+            sum(as_number(row.get("cpu_average")) for row in machine_rows),
+            1,
+        )
+        gpu_ratio = usage_ratio(person.get("gpu_memory_peak_bytes"), gpu_capacity) / 100.0
+        memory_ratio = usage_ratio(person.get("memory_peak_bytes"), memory_capacity) / 100.0
+        machine_ratio = min(1.0, as_number(person.get("machine_count")) / machine_capacity)
+        person["resource_score"] = round((gpu_ratio * 0.55 + memory_ratio * 0.30 + machine_ratio * 0.15) * 100, 1)
+        person.pop("person_key", None)
+        ranked.append(person)
+    ranked.sort(
+        key=lambda person: (
+            person.get("resource_score") or 0,
+            person.get("gpu_memory_peak_bytes") or 0,
+            person.get("memory_peak_bytes") or 0,
+            person.get("machine_count") or 0,
+        ),
+        reverse=True,
+    )
+    return ranked[: max(1, min(int(limit), 30))]
+
+
 class HourlyUsageReporter:
     def __init__(
         self,
@@ -434,6 +482,30 @@ class HourlyUsageReporter:
             )
         )
         return rows
+
+    def ranking_payload(self, identities=None, limit=10):
+        now = float(self.now_fn())
+        with self.lock:
+            rows = self.report_rows()
+            people = rank_usage_people(
+                rows,
+                identities or {},
+                memory_capacity_bytes=self.latest_capacity.get("memory_bytes"),
+                gpu_memory_capacity_bytes=self.latest_capacity.get("gpu_memory_bytes"),
+                active_machine_count=self.period_peaks.get("active_machines"),
+                limit=limit,
+            )
+            started_at = self.period_started_at
+            sample_count = self.snapshot_samples
+            active_users = self.period_peaks.get("active_users", 0)
+        return {
+            "window": "本小时至今",
+            "started_at": utc_iso(started_at),
+            "generated_at": utc_iso(now),
+            "sample_count": sample_count,
+            "active_users": active_users,
+            "people": people,
+        }
 
     def build_payload(self, now):
         rows = self.report_rows()[: self.max_users]

@@ -15,30 +15,31 @@ import urllib.request
 from collections import OrderedDict
 
 from server_probe.auth import AuthStore
-from server_probe.usage_reports import current_user_usage, format_bytes, format_percent
+from server_probe.usage_reports import format_bytes, format_percent, usage_bar
 
 
-HELP_TEXT = """设备资源助手支持以下查询：
-查人 崔涵帅
-查机 gpu010
-空闲GPU
-申请账号
-待审批（管理员）
-开通账号（管理员）
-帮助
+HELP_TEXT = """可以直接用自然语言询问：
+- 哪些四卡机现在空闲
+- 找一张至少 40 GB 可用显存的卡
+- 崔涵帅正在使用哪些资源
+- 最近哪些用户资源占用较高
+- gpu010 现在怎么样
+- 申请账号
 
-查询支持折叠卡片；账号写操作必须经过表单、身份校验和确认。"""
+管理员还可以查询待审批申请或主动开通账号。"""
 
 ALLOWED_INTENTS = {
     "help",
     "idle_gpu",
     "person",
     "machine",
+    "top_users",
     "request_account",
     "pending_requests",
     "provision_account",
     "admin_disabled",
     "clarify",
+    "chat",
 }
 
 
@@ -56,6 +57,8 @@ def parse_command(text):
         return "help", ""
     if compact in ("空闲gpu", "空闲显卡", "空闲卡", "可用gpu"):
         return "idle_gpu", ""
+    if compact in ("用户排行", "资源排行", "高占用用户", "谁占用最多"):
+        return "top_users", ""
     if compact in ("申请账号", "账号申请", "申请机器", "申请机器账号") or any(
         word in compact for word in ("想申请账号", "帮我申请账号")
     ):
@@ -79,6 +82,18 @@ def as_number(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def normalized_top_user_filters(value=None):
+    source = value if isinstance(value, dict) else {}
+    try:
+        limit = max(1, min(int(source.get("limit") or 10), 15))
+    except (TypeError, ValueError):
+        limit = 10
+    resource = str(source.get("resource") or "all").strip().lower()
+    if resource not in ("all", "gpu", "memory", "machines"):
+        resource = "all"
+    return {"limit": limit, "resource": resource}
 
 
 class LLMIntentRouter:
@@ -129,12 +144,15 @@ class LLMIntentRouter:
         return intent, argument
 
     def plan(self, text, previous=None, inventory=None):
+        return self.plans(text, previous=previous, inventory=inventory)[0]
+
+    def plans(self, text, previous=None, inventory=None):
         text = clean_command(text)[:500]
         safety_guard = parse_command(text)
         if safety_guard[0] == "admin_disabled":
-            return self.fallback_plan(text)
+            return [self.fallback_plan(text)]
         if not self.enabled:
-            return self.fallback_plan(text)
+            return [self.fallback_plan(text)]
         if isinstance(previous, (list, tuple)) and len(previous) >= 2:
             previous = {"intent": previous[0], "argument": previous[1], "filters": {}}
         previous = previous if isinstance(previous, dict) else {}
@@ -148,9 +166,9 @@ class LLMIntentRouter:
             if key in self.cache:
                 return self.cache[key]
         try:
-            result = self.classify(text, previous=previous, inventory=inventory)
+            result = self.classify_many(text, previous=previous, inventory=inventory)
         except Exception:
-            return self.fallback_plan(text)
+            return [self.fallback_plan(text)]
         with self.lock:
             self.cache[key] = result
             while len(self.cache) > 256:
@@ -158,22 +176,31 @@ class LLMIntentRouter:
         return result
 
     def classify(self, text, previous=None, inventory=None):
+        return self.classify_many(text, previous=previous, inventory=inventory)[0]
+
+    def classify_many(self, text, previous=None, inventory=None):
         system_prompt = (
-            "你是设备资源助手的工具规划器，负责理解自然中文和连续追问。只输出一个 JSON 对象，不要解释。"
+            "你是设备资源助手的工具规划器，负责理解自然中文、连续追问和一句话中的多个独立问题。"
+            "只输出一个 JSON 对象，不要解释；格式是 {\"actions\":[...]}，按用户提问顺序最多输出 3 个动作。"
             "可选 intent：idle_gpu、person、machine、request_account、pending_requests、provision_account、"
-            "admin_disabled、help、clarify。"
+            "top_users、admin_disabled、help、clarify、chat。"
             "idle_gpu 用于查询机器清单、空闲机器、GPU 容量或按条件找机器。filters 可包含："
             "gpu_count（每台机器的 GPU 张数，整数或 null）、group（机器组或 null）、idle_only（布尔值）、"
             "min_free_gpu_memory_gb（要求单卡至少多少 GB 空闲显存或 null）、gpu_model（型号关键词或 null）。"
             "person 查询某个人或账号，argument 填姓名/账号；machine 查询一台明确机器，argument 填名称/IP。"
+            "top_users 查询本小时资源使用较高的用户；filters.limit 是 1 到 15，filters.resource 可为 all、gpu、memory、machines。"
             "request_account 是普通用户提交申请；pending_requests 是管理员看待审批；provision_account 是管理员主动开账号。"
             "删除账号、改密码、直接批准等未开放写操作用 admin_disabled。真正不明确时用 clarify，clarification 给一句具体追问。"
+            "chat 只用于问候、反馈和解释上一轮对话，response 给不超过 100 字的简短回复；chat 不得声称任何实时资源事实。"
             "结合 previous 理解‘那四卡机呢’‘它呢’等追问，并继承仍然适用的条件。"
             "inventory 仅说明系统现有分组和 GPU 张数类型，不要臆造机器或资源数据。"
-            "示例：‘查空闲机器吧，四卡机的呢’应输出 "
-            "{\"intent\":\"idle_gpu\",\"argument\":\"\",\"filters\":{\"gpu_count\":4,"
+            "每个动作格式为 {\"intent\":\"...\",\"argument\":\"\",\"filters\":{},\"clarification\":\"\"}。"
+            "示例：‘查空闲机器吧，四卡机的呢’输出 "
+            "{\"actions\":[{\"intent\":\"idle_gpu\",\"argument\":\"\",\"filters\":{\"gpu_count\":4,"
             "\"group\":null,\"idle_only\":true,\"min_free_gpu_memory_gb\":null,\"gpu_model\":null},"
-            "\"clarification\":\"\"}。"
+            "\"clarification\":\"\"}]}。"
+            "示例：‘你还会啥？有哪些用户最近使用机器量很大’必须拆成两个动作：help 和 top_users，不能忽略后一个问题。"
+            "如果 previous 显示上一句包含多个动作，而用户问‘为什么第二个没回复’，用 chat 并在 response 中说明看到的动作。"
         )
         body = {
             "model": self.model,
@@ -219,22 +246,36 @@ class LLMIntentRouter:
         if not match:
             raise ValueError("LLM did not return JSON")
         parsed = json.loads(match.group(0))
-        intent = str(parsed.get("intent") or "help").strip()
-        argument = " ".join(str(parsed.get("argument") or "").strip().split())[:100]
+        actions = parsed.get("actions") if isinstance(parsed.get("actions"), list) else [parsed]
+        normalized = [self.normalize_action(action) for action in actions[:3] if isinstance(action, dict)]
+        return normalized or [self.fallback_plan(text)]
+
+    def normalize_action(self, action):
+        intent = str(action.get("intent") or "help").strip()
+        argument = " ".join(str(action.get("argument") or "").strip().split())[:100]
         if intent not in ALLOWED_INTENTS:
             intent = "help"
-        filters = parsed.get("filters") if isinstance(parsed.get("filters"), dict) else {}
-        normalized_filters = normalized_resource_filters(filters)
+        filters = action.get("filters") if isinstance(action.get("filters"), dict) else {}
+        if intent == "idle_gpu":
+            normalized_filters = normalized_resource_filters(filters)
+        elif intent == "top_users":
+            normalized_filters = normalized_top_user_filters(filters)
+        else:
+            normalized_filters = {}
         if intent in ("person", "machine") and not argument:
             intent = "clarify"
-            parsed["clarification"] = "你想查询哪位用户或哪台机器？"
-        clarification = " ".join(str(parsed.get("clarification") or "").strip().split())[:240]
+            action["clarification"] = "你想查询哪位用户或哪台机器？"
+        clarification = " ".join(str(action.get("clarification") or "").strip().split())[:240]
+        if intent == "chat":
+            clarification = " ".join(str(action.get("response") or clarification).strip().split())[:240]
+            if not clarification:
+                clarification = "我看到了你的消息，请继续告诉我想查询什么。"
         if intent == "clarify" and not clarification:
             clarification = "请再补充一下要查询的人、机器或资源条件。"
         return {
             "intent": intent,
             "argument": argument,
-            "filters": normalized_filters if intent == "idle_gpu" else {},
+            "filters": normalized_filters,
             "clarification": clarification,
         }
 
@@ -269,6 +310,49 @@ def compact_card(title, summary, sections=None, template="turquoise"):
         "schema": "2.0",
         "config": {"width_mode": "fill", "enable_forward": True},
         "header": {"template": template, "title": {"tag": "plain_text", "content": str(title)[:120]}},
+        "body": {"direction": "vertical", "padding": "12px 12px 12px 12px", "elements": elements},
+    }
+
+
+def prefix_card_element_ids(value, prefix):
+    if isinstance(value, list):
+        return [prefix_card_element_ids(item, prefix) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key == "element_id" and item:
+            result[key] = "%s_%s" % (prefix, item)
+        else:
+            result[key] = prefix_card_element_ids(item, prefix)
+    return result
+
+
+def combine_cards(cards):
+    cards = [card for card in cards if card]
+    if not cards:
+        return None
+    if len(cards) == 1:
+        return cards[0]
+    elements = []
+    for index, card in enumerate(cards, 1):
+        title = (((card.get("header") or {}).get("title") or {}).get("content") or "查询结果")
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": "<font color='grey'>**%d. %s**</font>" % (index, str(title)[:100]),
+            }
+        )
+        elements.extend(prefix_card_element_ids((card.get("body") or {}).get("elements") or [], "result%d" % index))
+        if index < len(cards):
+            elements.append({"tag": "hr"})
+    return {
+        "schema": "2.0",
+        "config": {"width_mode": "fill", "enable_forward": False},
+        "header": {
+            "template": "turquoise",
+            "title": {"tag": "plain_text", "content": "设备资源助手 · %d 项结果" % len(cards)},
+        },
         "body": {"direction": "vertical", "padding": "12px 12px 12px 12px", "elements": elements},
     }
 
@@ -323,6 +407,102 @@ def person_card(payload):
     return compact_card("用户资源 · %s" % display, summary, sections)
 
 
+def selected_top_users(payload, filters=None):
+    filters = normalized_top_user_filters(filters)
+    people = list((payload or {}).get("people") or [])
+    resource = filters["resource"]
+    if resource == "gpu":
+        people = [person for person in people if person.get("gpu_memory_peak_bytes")]
+        people.sort(key=lambda person: person.get("gpu_memory_peak_bytes") or 0, reverse=True)
+    elif resource == "memory":
+        people.sort(key=lambda person: person.get("memory_peak_bytes") or 0, reverse=True)
+    elif resource == "machines":
+        people.sort(
+            key=lambda person: (
+                person.get("machine_count") or 0,
+                person.get("gpu_memory_peak_bytes") or 0,
+                person.get("memory_peak_bytes") or 0,
+            ),
+            reverse=True,
+        )
+    return people[: filters["limit"]]
+
+
+def top_users_text(payload, filters=None):
+    people = selected_top_users(payload, filters)
+    if not people:
+        return "本时段没有检测到符合条件的普通用户资源记录。"
+    lines = ["%s高资源用户：" % ((payload or {}).get("window") or "近期")]
+    for index, person in enumerate(people, 1):
+        display = person.get("display_name") or ", ".join(person.get("usernames") or []) or "未登记用户"
+        lines.append(
+            "%d. %s · %d 台机器 · GPU %d 张 · 显存 %s · 内存 %s"
+            % (
+                index,
+                display,
+                int(person.get("machine_count") or 0),
+                int(person.get("gpu_count") or 0),
+                format_bytes(person.get("gpu_memory_peak_bytes")),
+                format_bytes(person.get("memory_peak_bytes")),
+            )
+        )
+    return "\n".join(lines)[:3900]
+
+
+def top_users_card(payload, filters=None):
+    people = selected_top_users(payload, filters)
+    window = (payload or {}).get("window") or "近期"
+    if not people:
+        return compact_card("高资源用户", "%s没有检测到符合条件的普通用户记录。" % window, template="grey")
+    sections = []
+    for index, person in enumerate(people, 1):
+        display = person.get("display_name") or ", ".join(person.get("usernames") or []) or "未登记用户"
+        usernames = "、".join(person.get("usernames") or []) or "-"
+        lines = [
+            "账号 `%s` · 机器 **%d** 台 · GPU **%d** 张"
+            % (usernames, int(person.get("machine_count") or 0), int(person.get("gpu_count") or 0)),
+            "显存峰值 **%s** · 内存峰值 **%s** · CPU 均值合计 **%s**"
+            % (
+                format_bytes(person.get("gpu_memory_peak_bytes")),
+                format_bytes(person.get("memory_peak_bytes")),
+                format_percent(person.get("cpu_average_sum")),
+            ),
+            "综合资源强度 %s" % usage_bar(person.get("resource_score"), 100, 8),
+        ]
+        for row in (person.get("machine_rows") or [])[:6]:
+            gpu_indices = ",".join(row.get("gpu_indices") or [])
+            machine_line = "- **%s** · `%s`" % (row.get("server_name") or row.get("server_id"), row.get("user") or "-")
+            if gpu_indices:
+                machine_line += " · GPU " + gpu_indices
+            machine_line += "\n  显存 %s · 内存 %s · CPU %s" % (
+                format_bytes(row.get("gpu_memory_peak_bytes")),
+                format_bytes(row.get("memory_peak_bytes")),
+                format_percent(row.get("cpu_average")),
+            )
+            lines.append(machine_line)
+            process = row.get("top_gpu_process") or {}
+            if process:
+                label = process.get("container_name") or process.get("model") or process.get("process_name") or "unknown"
+                lines.append("  最高显存进程 `%s` · PID %s · %s" % (
+                    label,
+                    process.get("pid") or "-",
+                    format_bytes(process.get("used_memory_bytes")),
+                ))
+        sections.append(
+            {
+                "title": "%d. %s · %d 台 · 显存 %s"
+                % (index, display, int(person.get("machine_count") or 0), format_bytes(person.get("gpu_memory_peak_bytes"))),
+                "content": "\n".join(lines),
+            }
+        )
+    summary = "%s · **%d** 次采样 · 活跃用户 **%d** 人\n按综合资源强度排序，点击姓名查看机器和进程。" % (
+        window,
+        int((payload or {}).get("sample_count") or 0),
+        int((payload or {}).get("active_users") or len(people)),
+    )
+    return compact_card("近期高资源用户", summary, sections, template="orange")
+
+
 class DashboardAPI:
     def __init__(self, dsn, base_url="http://127.0.0.1:8088"):
         self.store = AuthStore(dsn, session_hours=1)
@@ -367,6 +547,10 @@ class DashboardAPI:
 
     def person(self, name):
         return self.get("/api/user-usage?person=" + urllib.parse.quote(name, safe=""))
+
+    def top_users(self, limit=10):
+        limit = max(1, min(int(limit), 30))
+        return self.get("/api/user-usage-ranking?limit=%d" % limit) or {}
 
     def machines(self):
         return (self.get("/api/request-machines") or {}).get("machines") or []
@@ -497,14 +681,29 @@ class ConversationMemory:
             self.values.move_to_end(key)
             return result
 
-    def remember(self, key, user_text, plan):
+    def remember(self, key, user_text, plans):
+        if isinstance(plans, dict):
+            plans = [plans]
+        actions = []
+        for plan in (plans or [])[:3]:
+            intent = str(plan.get("intent") or "help")
+            filters = plan.get("filters") or {}
+            if intent == "idle_gpu":
+                filters = normalized_resource_filters(filters)
+            elif intent == "top_users":
+                filters = normalized_top_user_filters(filters)
+            else:
+                filters = {}
+            actions.append(
+                {
+                    "intent": intent,
+                    "argument": str(plan.get("argument") or "")[:100],
+                    "filters": filters,
+                }
+            )
         context = {
             "user_text": clean_command(user_text)[:500],
-            "plan": {
-                "intent": str(plan.get("intent") or "help"),
-                "argument": str(plan.get("argument") or "")[:100],
-                "filters": normalized_resource_filters(plan.get("filters")),
-            },
+            "actions": actions,
         }
         with self.lock:
             self.values[key] = (context, time.time())
@@ -1332,6 +1531,53 @@ class FeishuResourceBot:
             return ""
         return payload.get("text") or ""
 
+    def execute_plan(self, plan, sender_id, snapshot):
+        command = plan.get("intent") or "help"
+        argument = plan.get("argument") or ""
+        if command == "person":
+            if not argument:
+                answer = "请指定姓名或账号，例如：查人 崔涵帅"
+                return answer, compact_card("缺少用户", answer, template="orange")
+            payload = self.dashboard.person(argument)
+            return person_text(payload), person_card(payload)
+        if command == "machine":
+            snapshot = snapshot or self.dashboard.snapshot()
+            return machine_text(snapshot, argument), machine_card(snapshot, argument)
+        if command == "idle_gpu":
+            snapshot = snapshot or self.dashboard.snapshot()
+            filters = plan.get("filters") or {}
+            return idle_gpu_text(snapshot, filters), idle_gpu_card(snapshot, filters)
+        if command == "top_users":
+            filters = plan.get("filters") or {}
+            payload = self.dashboard.top_users(30)
+            return top_users_text(payload, filters), top_users_card(payload, filters)
+        if command == "request_account":
+            answer = "请在卡片中填写账号申请。"
+            return answer, account_form_card(self.dashboard.machines(), direct=False)
+        if command == "pending_requests":
+            if not self.is_admin(sender_id):
+                answer = "仅管理员可以查看待审批申请。"
+                return answer, compact_card("无管理员权限", answer, template="red")
+            requests = self.workflow.pending_requests()
+            answer = "当前有 %d 条待审批申请。" % len(requests)
+            return answer, pending_requests_card(requests)
+        if command == "provision_account":
+            if not self.is_admin(sender_id):
+                answer = "仅管理员可以主动开通账号。"
+                return answer, compact_card("无管理员权限", answer, template="red")
+            answer = "请在卡片中填写开通信息。"
+            return answer, account_form_card(self.dashboard.machines(), direct=True)
+        if command == "admin_disabled":
+            answer = "该写操作尚未开放，请使用“申请账号”“待审批”或“开通账号”。"
+            return answer, compact_card("操作尚未开放", answer, template="orange")
+        if command == "clarify":
+            answer = plan.get("clarification") or "请再补充一下要查询的人、机器或资源条件。"
+            return answer, compact_card("需要确认", answer, template="orange")
+        if command == "chat":
+            answer = plan.get("clarification") or "我看到了你的消息。"
+            return answer, compact_card("设备资源助手", answer, template="blue")
+        return HELP_TEXT, compact_card("设备资源助手", HELP_TEXT, template="blue")
+
     def on_message(self, data):
         message = data.event.message
         message_id = getattr(message, "message_id", "")
@@ -1347,60 +1593,25 @@ class FeishuResourceBot:
                 snapshot = self.dashboard.snapshot()
             except Exception:
                 snapshot = {}
-            plan = self.router.plan(
+            plans = self.router.plans(
                 user_text,
                 previous=self.context.get(context_key),
                 inventory=snapshot_inventory(snapshot),
             )
-            command = plan.get("intent") or "help"
-            argument = plan.get("argument") or ""
-            if command in ("person", "machine", "idle_gpu"):
-                self.context.remember(context_key, user_text, plan)
-            card = None
-            if command == "person":
-                if not argument:
-                    answer = "请指定姓名或账号，例如：查人 崔涵帅"
-                    card = compact_card("缺少用户", answer, template="orange")
-                else:
-                    payload = self.dashboard.person(argument)
-                    answer = person_text(payload)
-                    card = person_card(payload)
-            elif command == "machine":
-                snapshot = snapshot or self.dashboard.snapshot()
-                answer = machine_text(snapshot, argument)
-                card = machine_card(snapshot, argument)
-            elif command == "idle_gpu":
-                snapshot = snapshot or self.dashboard.snapshot()
-                filters = plan.get("filters") or {}
-                answer = idle_gpu_text(snapshot, filters)
-                card = idle_gpu_card(snapshot, filters)
-            elif command == "request_account":
-                answer = "请在卡片中填写账号申请。"
-                card = account_form_card(self.dashboard.machines(), direct=False)
-            elif command == "pending_requests":
-                if not self.is_admin(sender_id):
-                    answer = "仅管理员可以查看待审批申请。"
-                    card = compact_card("无管理员权限", answer, template="red")
-                else:
-                    requests = self.workflow.pending_requests()
-                    answer = "当前有 %d 条待审批申请。" % len(requests)
-                    card = pending_requests_card(requests)
-            elif command == "provision_account":
-                if not self.is_admin(sender_id):
-                    answer = "仅管理员可以主动开通账号。"
-                    card = compact_card("无管理员权限", answer, template="red")
-                else:
-                    answer = "请在卡片中填写开通信息。"
-                    card = account_form_card(self.dashboard.machines(), direct=True)
-            elif command == "admin_disabled":
-                answer = "该写操作尚未开放，请使用“申请账号”“待审批”或“开通账号”。"
-                card = compact_card("操作尚未开放", answer, template="orange")
-            elif command == "clarify":
-                answer = plan.get("clarification") or "请再补充一下要查询的人、机器或资源条件。"
-                card = compact_card("需要确认", answer, template="orange")
-            else:
-                answer = HELP_TEXT
-                card = compact_card("设备资源助手", HELP_TEXT, template="blue")
+            self.context.remember(context_key, user_text, plans)
+            answers = []
+            cards = []
+            for plan in plans:
+                try:
+                    current_answer, current_card = self.execute_plan(plan, sender_id, snapshot)
+                except Exception as exc:
+                    print("action failed intent=%s error=%s" % (plan.get("intent"), type(exc).__name__), flush=True)
+                    current_answer = "其中一项查询暂时失败，请稍后重试。"
+                    current_card = compact_card("查询失败", current_answer, template="red")
+                answers.append(current_answer)
+                cards.append(current_card)
+            answer = "\n\n".join(answers)[:3900]
+            card = combine_cards(cards)
         except Exception as exc:
             print("query failed: %s" % type(exc).__name__, flush=True)
             answer = "查询暂时失败，请稍后重试。"
