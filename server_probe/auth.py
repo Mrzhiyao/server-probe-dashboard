@@ -139,6 +139,7 @@ class AuthStore:
                 cur.execute("ALTER TABLE probe_model_requests ADD COLUMN IF NOT EXISTS target_machine_label TEXT")
                 cur.execute("ALTER TABLE probe_model_requests ADD COLUMN IF NOT EXISTS requested_account TEXT")
                 cur.execute("ALTER TABLE probe_model_requests ADD COLUMN IF NOT EXISTS requested_password TEXT")
+                cur.execute("ALTER TABLE probe_model_requests ADD COLUMN IF NOT EXISTS model_key TEXT")
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS probe_machine_accounts (
@@ -168,6 +169,52 @@ class AuthStore:
                     )
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS probe_model_services (
+                      id BIGSERIAL PRIMARY KEY,
+                      model_key TEXT NOT NULL,
+                      model_name TEXT NOT NULL,
+                      served_name TEXT NOT NULL,
+                      status TEXT NOT NULL DEFAULT 'deploying',
+                      worker_id TEXT NOT NULL,
+                      worker_name TEXT,
+                      container_name TEXT NOT NULL UNIQUE,
+                      gpu_indices JSONB NOT NULL DEFAULT '[]'::jsonb,
+                      host_port INTEGER,
+                      image TEXT,
+                      oneapi_channel_id BIGINT,
+                      source TEXT NOT NULL DEFAULT 'managed',
+                      error_message TEXT,
+                      created_by BIGINT REFERENCES probe_users(id) ON DELETE SET NULL,
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                      started_at TIMESTAMPTZ,
+                      stopped_at TIMESTAMPTZ
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS probe_model_allocations (
+                      id BIGSERIAL PRIMARY KEY,
+                      service_id BIGINT NOT NULL REFERENCES probe_model_services(id) ON DELETE CASCADE,
+                      request_id BIGINT UNIQUE REFERENCES probe_model_requests(id) ON DELETE SET NULL,
+                      requester_id BIGINT NOT NULL REFERENCES probe_users(id) ON DELETE CASCADE,
+                      owner_name TEXT,
+                      status TEXT NOT NULL DEFAULT 'provisioning',
+                      oneapi_token_id BIGINT,
+                      token_name TEXT,
+                      quota BIGINT,
+                      expires_at TIMESTAMPTZ,
+                      error_message TEXT,
+                      created_by BIGINT REFERENCES probe_users(id) ON DELETE SET NULL,
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                      revoked_at TIMESTAMPTZ
+                    )
+                    """
+                )
                 cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS probe_machine_accounts_username_machine_idx ON probe_machine_accounts(username, machine_key)")
                 cur.execute("CREATE INDEX IF NOT EXISTS probe_sessions_user_id_idx ON probe_sessions(user_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS probe_sessions_expires_at_idx ON probe_sessions(expires_at)")
@@ -175,6 +222,9 @@ class AuthStore:
                 cur.execute("CREATE INDEX IF NOT EXISTS probe_model_requests_status_idx ON probe_model_requests(status)")
                 cur.execute("CREATE INDEX IF NOT EXISTS probe_model_requests_type_idx ON probe_model_requests(request_type)")
                 cur.execute("CREATE INDEX IF NOT EXISTS probe_machine_accounts_display_idx ON probe_machine_accounts(display_name)")
+                cur.execute("CREATE INDEX IF NOT EXISTS probe_model_services_model_idx ON probe_model_services(model_key, status)")
+                cur.execute("CREATE INDEX IF NOT EXISTS probe_model_allocations_service_idx ON probe_model_allocations(service_id, status)")
+                cur.execute("CREATE INDEX IF NOT EXISTS probe_model_allocations_requester_idx ON probe_model_allocations(requester_id, status)")
 
     def set_password(self, username, password, role=None, display_name=None):
         hashed = password_hash(password)
@@ -382,6 +432,275 @@ class AuthStore:
             "updated_at": row[6].isoformat() if row[6] else None,
         }
 
+    def model_service_dict(self, row):
+        return {
+            "id": row[0],
+            "model_key": row[1],
+            "model_name": row[2],
+            "served_name": row[3],
+            "status": row[4],
+            "worker_id": row[5],
+            "worker_name": row[6],
+            "container_name": row[7],
+            "gpu_indices": [str(value) for value in (row[8] or [])],
+            "host_port": row[9],
+            "image": row[10],
+            "oneapi_channel_id": row[11],
+            "source": row[12],
+            "error_message": row[13],
+            "created_at": row[14].isoformat() if row[14] else None,
+            "updated_at": row[15].isoformat() if row[15] else None,
+            "started_at": row[16].isoformat() if row[16] else None,
+            "stopped_at": row[17].isoformat() if row[17] else None,
+            "active_allocations": int(row[18] or 0),
+            "total_allocations": int(row[19] or 0),
+            "next_expiry": row[20].isoformat() if row[20] else None,
+        }
+
+    def model_service_select_sql(self):
+        return """
+            SELECT
+              s.id, s.model_key, s.model_name, s.served_name, s.status,
+              s.worker_id, s.worker_name, s.container_name, s.gpu_indices,
+              s.host_port, s.image, s.oneapi_channel_id, s.source, s.error_message,
+              s.created_at, s.updated_at, s.started_at, s.stopped_at,
+              COUNT(a.id) FILTER (
+                WHERE a.status = 'active' AND (a.expires_at IS NULL OR a.expires_at > now())
+              ) AS active_allocations,
+              COUNT(a.id) AS total_allocations,
+              MIN(a.expires_at) FILTER (
+                WHERE a.status = 'active' AND a.expires_at > now()
+              ) AS next_expiry
+            FROM probe_model_services s
+            LEFT JOIN probe_model_allocations a ON a.service_id = s.id
+        """
+
+    def list_model_services(self, user=None):
+        where = ""
+        params = ()
+        if user and user.get("role") != "admin":
+            where = """
+                WHERE EXISTS (
+                  SELECT 1 FROM probe_model_allocations visible
+                  WHERE visible.service_id = s.id AND visible.requester_id = %s
+                )
+            """
+            params = (user["id"],)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    self.model_service_select_sql()
+                    + where
+                    + """
+                    GROUP BY s.id
+                    ORDER BY s.created_at DESC
+                    """,
+                    params,
+                )
+                return [self.model_service_dict(row) for row in cur.fetchall()]
+
+    def get_model_service(self, service_id):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    self.model_service_select_sql()
+                    + """
+                    WHERE s.id = %s
+                    GROUP BY s.id
+                    """,
+                    (service_id,),
+                )
+                row = cur.fetchone()
+                return self.model_service_dict(row) if row else None
+
+    def find_active_model_service(self, model_key):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    self.model_service_select_sql()
+                    + """
+                    WHERE s.model_key = %s AND s.status IN ('deploying', 'running')
+                    GROUP BY s.id
+                    ORDER BY CASE WHEN s.status = 'running' THEN 0 ELSE 1 END, s.created_at
+                    LIMIT 1
+                    """,
+                    (str(model_key or "").strip(),),
+                )
+                row = cur.fetchone()
+                return self.model_service_dict(row) if row else None
+
+    def create_model_service(self, data):
+        from psycopg2.extras import Json
+
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO probe_model_services (
+                      model_key, model_name, served_name, status, worker_id, worker_name,
+                      container_name, gpu_indices, host_port, image, oneapi_channel_id,
+                      source, error_message, created_by, started_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                              CASE WHEN %s = 'running' THEN now() ELSE NULL END)
+                    RETURNING id
+                    """,
+                    (
+                        data.get("model_key"), data.get("model_name"), data.get("served_name"),
+                        data.get("status") or "deploying", data.get("worker_id"), data.get("worker_name"),
+                        data.get("container_name"), Json(data.get("gpu_indices") or []), data.get("host_port"),
+                        data.get("image"), data.get("oneapi_channel_id"), data.get("source") or "managed",
+                        data.get("error_message"), data.get("created_by"), data.get("status") or "deploying",
+                    ),
+                )
+                service_id = cur.fetchone()[0]
+        return self.get_model_service(service_id)
+
+    def seed_model_service(self, data):
+        from psycopg2.extras import Json
+
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO probe_model_services (
+                      model_key, model_name, served_name, status, worker_id, worker_name,
+                      container_name, gpu_indices, host_port, image, oneapi_channel_id,
+                      source, created_by, started_at
+                    ) VALUES (%s, %s, %s, 'running', %s, %s, %s, %s, %s, %s, %s, 'seed', %s, now())
+                    ON CONFLICT (container_name) DO NOTHING
+                    RETURNING id
+                    """,
+                    (
+                        data.get("model_key"), data.get("model_name"), data.get("served_name"),
+                        data.get("worker_id"), data.get("worker_name"), data.get("container_name"),
+                        Json(data.get("gpu_indices") or []), data.get("host_port"), data.get("image"),
+                        data.get("oneapi_channel_id"), data.get("created_by"),
+                    ),
+                )
+                row = cur.fetchone()
+                service_id = row[0] if row else None
+                if service_id is None:
+                    cur.execute("SELECT id FROM probe_model_services WHERE container_name = %s", (data.get("container_name"),))
+                    service_id = cur.fetchone()[0]
+        return self.get_model_service(service_id)
+
+    def update_model_service(self, service_id, **values):
+        from psycopg2.extras import Json
+
+        columns = {
+            "status": "status",
+            "gpu_indices": "gpu_indices",
+            "host_port": "host_port",
+            "oneapi_channel_id": "oneapi_channel_id",
+            "error_message": "error_message",
+        }
+        assignments = []
+        params = []
+        for key, column in columns.items():
+            if key not in values:
+                continue
+            assignments.append("%s = %%s" % column)
+            params.append(Json(values[key]) if key == "gpu_indices" else values[key])
+        if not assignments:
+            return self.get_model_service(service_id)
+        status = values.get("status")
+        if status == "running":
+            assignments.append("started_at = COALESCE(started_at, now())")
+            assignments.append("stopped_at = NULL")
+        elif status in ("stopped", "failed"):
+            assignments.append("stopped_at = now()")
+        assignments.append("updated_at = now()")
+        params.append(service_id)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE probe_model_services SET %s WHERE id = %%s" % ", ".join(assignments),
+                    tuple(params),
+                )
+        return self.get_model_service(service_id)
+
+    def model_allocation_dict(self, row):
+        return {
+            "id": row[0],
+            "service_id": row[1],
+            "request_id": row[2],
+            "requester_id": row[3],
+            "owner_name": row[4],
+            "status": row[5],
+            "oneapi_token_id": row[6],
+            "token_name": row[7],
+            "quota": row[8],
+            "expires_at": row[9].isoformat() if row[9] else None,
+            "error_message": row[10],
+            "created_at": row[11].isoformat() if row[11] else None,
+            "updated_at": row[12].isoformat() if row[12] else None,
+            "revoked_at": row[13].isoformat() if row[13] else None,
+        }
+
+    def get_model_allocation(self, allocation_id=None, request_id=None):
+        if allocation_id is None and request_id is None:
+            return None
+        field = "id" if allocation_id is not None else "request_id"
+        value = allocation_id if allocation_id is not None else request_id
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, service_id, request_id, requester_id, owner_name, status,
+                           oneapi_token_id, token_name, quota, expires_at, error_message,
+                           created_at, updated_at, revoked_at
+                    FROM probe_model_allocations
+                    WHERE %s = %%s
+                    """ % field,
+                    (value,),
+                )
+                row = cur.fetchone()
+                return self.model_allocation_dict(row) if row else None
+
+    def create_model_allocation(self, data):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                if data.get("request_id") is not None:
+                    cur.execute("SELECT id FROM probe_model_allocations WHERE request_id = %s", (data.get("request_id"),))
+                    existing = cur.fetchone()
+                    if existing:
+                        return self.get_model_allocation(allocation_id=existing[0])
+                cur.execute(
+                    """
+                    INSERT INTO probe_model_allocations (
+                      service_id, request_id, requester_id, owner_name, status,
+                      token_name, quota, expires_at, created_by
+                    ) VALUES (%s, %s, %s, %s, 'provisioning', %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        data.get("service_id"), data.get("request_id"), data.get("requester_id"),
+                        data.get("owner_name"), data.get("token_name"), data.get("quota"),
+                        data.get("expires_at"), data.get("created_by"),
+                    ),
+                )
+                allocation_id = cur.fetchone()[0]
+        return self.get_model_allocation(allocation_id=allocation_id)
+
+    def update_model_allocation(self, allocation_id, status, token_id=None, error_message=None):
+        if status not in ("provisioning", "active", "failed", "revoked", "expired"):
+            raise ValueError("invalid model allocation status")
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE probe_model_allocations
+                    SET status = %s,
+                        oneapi_token_id = COALESCE(%s, oneapi_token_id),
+                        error_message = %s,
+                        revoked_at = CASE WHEN %s IN ('revoked', 'expired') THEN now() ELSE revoked_at END,
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (status, token_id, error_message, status, allocation_id),
+                )
+        return self.get_model_allocation(allocation_id=allocation_id)
+
     def update_existing_password(self, username, password):
         username = str(username or "").strip()
         if not username:
@@ -588,17 +907,18 @@ class AuthStore:
                 cur.execute(
                     """
                     INSERT INTO probe_model_requests (
-                      requester_id, request_type, owner_name, model_name, model_size, purpose, access_type,
+                      requester_id, request_type, owner_name, model_key, model_name, model_size, purpose, access_type,
                       gpu_count, gpu_memory_gb, duration_hours, target_machine, target_machine_label,
                       requested_account, requested_password, notes, recommendation
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
                         user_id,
                         data.get("request_type") or "temporary",
                         data.get("owner_name"),
+                        data.get("model_key"),
                         data.get("model_name"),
                         data.get("model_size"),
                         data.get("purpose"),
@@ -620,7 +940,7 @@ class AuthStore:
         return """
             SELECT
               r.id, r.requester_id, u.username, u.display_name, r.request_type, r.owner_name,
-              r.model_name, r.model_size, r.purpose, r.access_type, r.gpu_count,
+              r.model_key, r.model_name, r.model_size, r.purpose, r.access_type, r.gpu_count,
               r.gpu_memory_gb, r.duration_hours, r.target_machine, r.target_machine_label,
               r.requested_account, r.requested_password, r.notes, r.status,
               r.recommendation, r.admin_note, r.allocation_note, a.username,
@@ -686,7 +1006,7 @@ class AuthStore:
         return self.get_model_request(request_id, include_secret=True)
 
     def model_request_dict(self, row, include_secret=False):
-        secret = row[16]
+        secret = row[17]
         return {
             "id": row[0],
             "requester_id": row[1],
@@ -694,27 +1014,28 @@ class AuthStore:
             "requester_display_name": row[3],
             "request_type": row[4],
             "owner_name": row[5],
-            "model_name": row[6],
-            "model_size": row[7],
-            "purpose": row[8],
-            "access_type": row[9],
-            "gpu_count": row[10],
-            "gpu_memory_gb": float(row[11]) if row[11] is not None else None,
-            "duration_hours": row[12],
-            "target_machine": row[13],
-            "target_machine_label": row[14],
-            "requested_account": row[15],
+            "model_key": row[6],
+            "model_name": row[7],
+            "model_size": row[8],
+            "purpose": row[9],
+            "access_type": row[10],
+            "gpu_count": row[11],
+            "gpu_memory_gb": float(row[12]) if row[12] is not None else None,
+            "duration_hours": row[13],
+            "target_machine": row[14],
+            "target_machine_label": row[15],
+            "requested_account": row[16],
             "requested_password": secret if include_secret else None,
             "has_requested_password": bool(secret),
-            "notes": row[17],
-            "status": row[18],
-            "recommendation": row[19] or {},
-            "admin_note": row[20],
-            "allocation_note": row[21],
-            "decided_by": row[22],
-            "decided_at": row[23].isoformat() if row[23] else None,
-            "created_at": row[24].isoformat() if row[24] else None,
-            "updated_at": row[25].isoformat() if row[25] else None,
+            "notes": row[18],
+            "status": row[19],
+            "recommendation": row[20] or {},
+            "admin_note": row[21],
+            "allocation_note": row[22],
+            "decided_by": row[23],
+            "decided_at": row[24].isoformat() if row[24] else None,
+            "created_at": row[25].isoformat() if row[25] else None,
+            "updated_at": row[26].isoformat() if row[26] else None,
         }
 
 

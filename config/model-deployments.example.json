@@ -1,0 +1,32 @@
+{
+  "enabled": false,
+  "oneapi": {
+    "server_id": "gpu-worker-1",
+    "database_path": "/opt/one-api/one-api.db",
+    "user_id": 1,
+    "token_prefix": "sk-",
+    "default_quota": 5000000,
+    "public_base_url": "https://api.example.com/v1",
+    "access_hint": "Use the private network or an approved SSH tunnel."
+  },
+  "workers": [
+    {
+      "server_id": "gpu-worker-1",
+      "name": "GPU worker 1",
+      "enabled": true,
+      "model_root": "/mnt/model-nas/models",
+      "image": "vllm/vllm-openai:latest",
+      "allowed_gpu_indices": [0, 1],
+      "port_start": 18001,
+      "port_end": 18020,
+      "bind_host": "127.0.0.1",
+      "oneapi_base_url": "http://127.0.0.1:{port}",
+      "gpu_memory_utilization": 0.85,
+      "max_gpu_memory_percent": 10,
+      "max_model_len": 8192,
+      "startup_timeout_seconds": 600,
+      "internal_model_prefix": "internal/"
+    }
+  ],
+  "seed_services": []
+}

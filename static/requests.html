@@ -49,6 +49,7 @@
             </div>
 
             <form id="temporaryForm" class="request-form">
+              <input name="model_key" type="hidden" />
               <label>模型名称 <input name="model_name" placeholder="例如 Llama / Qwen / custom model" required /></label>
               <label>模型规模 <input name="model_size" placeholder="例如 7B, 32B, 72B" /></label>
               <label>
@@ -206,6 +207,6 @@
         </section>
       </main>
     </div>
-    <script src="/static/requests.js?v=20260825-models"></script>
+    <script src="/static/requests.js?v=20260825-managed-models"></script>
   </body>
 </html>

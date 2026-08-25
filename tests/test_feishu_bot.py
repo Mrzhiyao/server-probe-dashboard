@@ -10,6 +10,8 @@ from server_probe.feishu_bot import (
     compact_card,
     idle_gpu_card,
     machine_catalog_card,
+    model_form_card,
+    model_services_card,
     normalized_resource_query,
     parse_command,
     pending_requests_card,
@@ -46,6 +48,11 @@ class FeishuCommandTests(unittest.TestCase):
         self.assertEqual(parse_command("帮我开账号"), ("provision_account", ""))
         self.assertEqual(parse_command("申请账号"), ("request_account", ""))
         self.assertEqual(parse_command("删除账号"), ("admin_disabled", ""))
+
+    def test_model_commands_open_managed_workflows(self):
+        self.assertEqual(parse_command("申请模型"), ("request_model", ""))
+        self.assertEqual(parse_command("模型状态"), ("model_status", ""))
+        self.assertEqual(parse_command("创建模型"), ("deploy_model", ""))
 
     def test_duplicate_message_is_rejected(self):
         values = MessageDeduplicator()
@@ -260,6 +267,63 @@ class FeishuCommandTests(unittest.TestCase):
         approval_raw = json.dumps(approval, ensure_ascii=False)
         self.assertIn("approve_request", approval_raw)
         self.assertIn("reject_request", approval_raw)
+
+    def test_model_form_status_and_approval_cards(self):
+        models = [
+            {
+                "key": "Qwen-Test",
+                "name": "Qwen Test",
+                "served_model_name": "Qwen-Test",
+                "enabled": True,
+                "candidate": True,
+                "recommended_gpu_count": 1,
+            }
+        ]
+        request_form = json.dumps(model_form_card(models), ensure_ascii=False)
+        direct_form = json.dumps(model_form_card(models, direct=True), ensure_ascii=False)
+        self.assertIn("submit_model_request", request_form)
+        self.assertIn("direct_model_deploy", direct_form)
+        status = json.dumps(
+            model_services_card(
+                {
+                    "enabled": True,
+                    "api_base_url": "https://api.example/v1",
+                    "services": [
+                        {
+                            "served_name": "Qwen-Test",
+                            "worker_name": "GPU worker",
+                            "container_name": "probe-qwen",
+                            "gpu_indices": ["0"],
+                            "host_port": 18001,
+                            "active_allocations": 2,
+                            "runtime": {"status": "running", "health": "healthy"},
+                        }
+                    ],
+                }
+            ),
+            ensure_ascii=False,
+        )
+        self.assertIn("Qwen-Test", status)
+        self.assertIn("运行正常", status)
+        approval = json.dumps(
+            pending_requests_card(
+                [
+                    {
+                        "id": 8,
+                        "owner_name": "Alice",
+                        "request_type": "temporary",
+                        "access_type": "api",
+                        "model_key": "Qwen-Test",
+                        "model_name": "Qwen-Test",
+                        "gpu_count": 1,
+                        "duration_hours": 24,
+                    }
+                ]
+            ),
+            ensure_ascii=False,
+        )
+        self.assertIn("approve_model_request", approval)
+        self.assertIn("通过并部署", approval)
 
     def test_top_user_card_can_be_combined_with_help(self):
         ranking = top_users_card(

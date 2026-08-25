@@ -213,6 +213,7 @@ function fillModelRequest(model) {
   const form = els.temporaryForm;
   const gpuCount = Math.max(1, Number(model.recommended_gpu_count || 1));
   const estimatedPerGpu = Math.ceil(((Number(model.weight_gib || 0) * 1.2 + 2) / gpuCount) * 2) / 2;
+  form.elements.model_key.value = model.key || "";
   form.elements.model_name.value = model.served_model_name || model.name;
   form.elements.model_size.value = `${model.weight_gib || 0} GB 权重`;
   form.elements.access_type.value = "api";
@@ -361,6 +362,7 @@ function adminControls(request) {
   const recommended = request.recommendation?.candidates?.[0]?.server_id || "";
   const selectedMachine = request.target_machine || recommended;
   const accountType = request.request_type === "access" ? "access" : "temporary";
+  const managedModel = request.access_type === "api" && Boolean(request.model_key);
   const canProvision = request.status === "approved";
   const durationInput =
     accountType === "temporary"
@@ -381,6 +383,14 @@ function adminControls(request) {
     <button class="button" type="submit">保存</button>
   </form>`;
   if (!canProvision) return decisionForm;
+
+  if (managedModel) {
+    return `${decisionForm}
+    <form class="model-deploy-form" data-id="${request.id}">
+      <button class="button" type="submit">部署模型并创建 API</button>
+      <p class="form-message"></p>
+    </form>`;
+  }
 
   return `${decisionForm}
   <form class="provision-form" data-id="${request.id}">
@@ -507,6 +517,32 @@ function renderRequests() {
       } catch (error) {
         showMessage(message, escapeHtml(error.message || "开通失败"), true);
         showToast(error.message || "开通失败", true);
+      }
+    });
+  });
+  document.querySelectorAll(".model-deploy-form").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const message = form.querySelector(".form-message");
+      showMessage(message, "正在部署模型，首次启动可能需要几分钟...");
+      try {
+        const result = await fetchJson(`/api/resource-requests/${form.dataset.id}/deploy-model`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        const credential = result.credential || {};
+        const lines = [
+          `模型：${credential.model || "-"}`,
+          `Base URL：${credential.base_url || "-"}`,
+          `API Key：${credential.api_key || "-"}`,
+          `到期：${credential.expires_at || "-"}`,
+        ];
+        showMessage(message, lines.map(escapeHtml).join("<br />"));
+        showToast(result.reused ? "已复用现有模型服务并创建授权" : "模型服务已部署");
+      } catch (error) {
+        showMessage(message, escapeHtml(error.message || "部署失败"), true);
+        showToast(error.message || "部署失败", true);
       }
     });
   });

@@ -25,8 +25,10 @@ HELP_TEXT = """可以直接用自然语言询问：
 - 最近哪些用户资源占用较高
 - gpu010 现在怎么样
 - 申请账号
+- 申请模型
+- 模型状态
 
-管理员还可以查询待审批申请或主动开通账号。"""
+管理员还可以查询待审批申请、主动开通账号或部署模型。"""
 
 ALLOWED_INTENTS = {
     "help",
@@ -39,6 +41,9 @@ ALLOWED_INTENTS = {
     "request_account",
     "pending_requests",
     "provision_account",
+    "request_model",
+    "model_status",
+    "deploy_model",
     "admin_disabled",
     "clarify",
     "chat",
@@ -71,6 +76,12 @@ def parse_command(text):
         word in compact for word in ("帮我开账号", "我要开账号")
     ):
         return "provision_account", ""
+    if compact in ("申请模型", "模型申请", "申请模型服务", "申请api"):
+        return "request_model", ""
+    if compact in ("模型状态", "模型服务", "查看模型状态", "查询模型状态", "运行中的模型"):
+        return "model_status", ""
+    if compact in ("部署模型", "创建模型", "启动模型", "创建模型服务"):
+        return "deploy_model", ""
     for prefix, command in (("查人", "person"), ("查询用户", "person"), ("查机", "machine"), ("查询机器", "machine")):
         if value.startswith(prefix):
             return command, value[len(prefix) :].strip(" ：:")
@@ -222,6 +233,7 @@ class LLMIntentRouter:
             "你是设备资源助手的工具规划器，负责理解自然中文、连续追问和一句话中的多个独立问题。"
             "只输出一个 JSON 对象，不要解释；格式是 {\"actions\":[...]}，按用户提问顺序最多输出 3 个动作。"
             "可选 intent：idle_gpu、person、machine、request_account、pending_requests、provision_account、"
+            "request_model、model_status、deploy_model、"
             "machine_catalog、resource_query、top_users、admin_disabled、help、clarify、chat。"
             "idle_gpu 用于查询机器清单、空闲机器、GPU 容量或按条件找机器。filters 可包含："
             "gpu_count（每台机器的 GPU 张数，整数或 null）、group（机器组或 null）、idle_only（布尔值）、"
@@ -237,6 +249,10 @@ class LLMIntentRouter:
             "不能因为没有旧的固定指令而退回 help。缺少执行所需条件时才用 clarify。"
             "top_users 查询本小时资源使用较高的用户；filters.limit 是 1 到 15，filters.resource 可为 all、gpu、memory、machines。"
             "request_account 是普通用户提交申请；pending_requests 是管理员看待审批；provision_account 是管理员主动开账号。"
+            "request_model 是用户申请部署目录中已有模型的 API；model_status 查询已部署模型服务，可把模型关键词放 argument；"
+            "deploy_model 是管理员直接部署模型。"
+            "句子明确包含‘部署模型’‘创建模型’‘启动模型’时必须使用 deploy_model，不能因为不知道发送者角色而降级成 request_model；"
+            "只有‘申请模型’‘申请模型 API’‘想使用某模型’才使用 request_model，权限由后端另行判断。"
             "删除账号、改密码、直接批准等未开放写操作用 admin_disabled。真正不明确时用 clarify，clarification 给一句具体追问。"
             "chat 只用于问候、反馈和解释上一轮对话，response 给不超过 100 字的简短回复；chat 不得声称任何实时资源事实。"
             "结合 previous 理解‘那四卡机呢’‘它呢’等追问，并继承仍然适用的条件。"
@@ -666,7 +682,7 @@ class DashboardAPI:
         self.store = AuthStore(dsn, session_hours=1)
         self.base_url = base_url.rstrip("/")
 
-    def request(self, path, method="GET", data=None):
+    def request(self, path, method="GET", data=None, timeout=10):
         admin = self.store.get_user_by_username("admin")
         if not admin:
             raise RuntimeError("dashboard admin account is unavailable")
@@ -683,12 +699,16 @@ class DashboardAPI:
                 headers=headers,
                 method=method,
             )
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return None
-            raise RuntimeError("dashboard API returned HTTP %s" % exc.code) from None
+            try:
+                payload = json.loads(exc.read().decode("utf-8", "replace"))
+            except Exception:
+                payload = {}
+            raise RuntimeError(str(payload.get("error") or "dashboard API returned HTTP %s" % exc.code)) from None
         except (urllib.error.URLError, TimeoutError, OSError):
             raise RuntimeError("dashboard API is unavailable") from None
         finally:
@@ -697,8 +717,8 @@ class DashboardAPI:
     def get(self, path):
         return self.request(path)
 
-    def post(self, path, data=None):
-        return self.request(path, method="POST", data=data or {})
+    def post(self, path, data=None, timeout=10):
+        return self.request(path, method="POST", data=data or {}, timeout=timeout)
 
     def snapshot(self):
         return self.get("/api/snapshot") or {}
@@ -715,6 +735,20 @@ class DashboardAPI:
 
     def machines(self):
         return (self.get("/api/request-machines") or {}).get("machines") or []
+
+    def models(self):
+        payload = self.get("/api/model-catalog") or {}
+        return [item for item in payload.get("models", []) if item.get("enabled") and item.get("candidate")]
+
+    def model_services(self, query=""):
+        suffix = "?q=" + urllib.parse.quote(str(query or ""), safe="") if query else ""
+        return self.get("/api/model-services" + suffix) or {}
+
+    def deploy_model(self, data):
+        return self.post("/api/model-services/deploy", data, timeout=900)
+
+    def deploy_requested_model(self, request_id):
+        return self.post("/api/resource-requests/%d/deploy-model" % int(request_id), {}, timeout=900)
 
 
 class FeishuWorkflowStore:
@@ -1434,6 +1468,144 @@ def account_form_card(machines, direct=False):
     }
 
 
+def model_form_card(models, direct=False):
+    available = [item for item in models if item.get("enabled") and item.get("candidate")]
+    if not available:
+        return compact_card("模型服务", "当前没有已验证并开放的目录模型。", template="orange")
+    options = []
+    for model in available[:50]:
+        label = "%s · %s GPU" % (model.get("name"), model.get("recommended_gpu_count") or 1)
+        options.append(
+            {
+                "text": {"tag": "plain_text", "content": label[:100]},
+                "value": str(model.get("key"))[:240],
+            }
+        )
+    elements = [
+        {"tag": "markdown", "content": "**目录模型**"},
+        form_select("model_key", "模型", options, required=True, initial_option=options[0]["value"]),
+        form_input("owner_name", "姓名", "真实姓名", required=True),
+        form_input("duration_hours", "使用时长（小时）", "1-720", required=True, default_value="24"),
+        form_select(
+            "gpu_count",
+            "GPU 数量",
+            [
+                {"text": {"tag": "plain_text", "content": "%d 张" % count}, "value": str(count)}
+                for count in (1, 2, 4, 8)
+            ],
+            required=True,
+            initial_option="1",
+        ),
+        form_input("purpose", "用途", "例如代码生成 API", required=True),
+        {
+            "tag": "button",
+            "name": "submit",
+            "form_action_type": "submit",
+            "type": "primary",
+            "width": "fill",
+            "text": {"tag": "plain_text", "content": "立即部署" if direct else "提交申请"},
+            "behaviors": [
+                {"type": "callback", "value": {"action": "direct_model_deploy" if direct else "submit_model_request"}}
+            ],
+        },
+    ]
+    return {
+        "schema": "2.0",
+        "config": {"width_mode": "fill", "enable_forward": False},
+        "header": {
+            "template": "orange" if direct else "blue",
+            "title": {"tag": "plain_text", "content": "管理员部署模型" if direct else "申请模型 API"},
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "选择已开放的模型；已运行的模型会直接复用现有服务。",
+                    "text_size": "notation",
+                },
+                {"tag": "form", "name": "model_form", "elements": elements},
+            ]
+        },
+    }
+
+
+def model_runtime_label(runtime):
+    status = str((runtime or {}).get("status") or "unknown")
+    health = str((runtime or {}).get("health") or "unknown")
+    if status == "running" and health == "healthy":
+        return "运行正常"
+    labels = {
+        "worker_offline": "机器离线",
+        "missing": "容器缺失",
+        "stopped": "已停止",
+        "exited": "已退出",
+        "deploying": "部署中",
+    }
+    return labels.get(status, status)
+
+
+def model_services_text(payload):
+    services = payload.get("services") or []
+    if not payload.get("enabled"):
+        return "模型部署功能当前未启用。"
+    if not services:
+        return "当前没有匹配的模型服务。"
+    running = sum(1 for item in services if (item.get("runtime") or {}).get("status") == "running")
+    return "共 %d 个模型服务，%d 个正在运行。" % (len(services), running)
+
+
+def model_services_card(payload):
+    services = payload.get("services") or []
+    if not payload.get("enabled"):
+        return compact_card("模型服务", "模型部署功能当前未启用。", template="orange")
+    if not services:
+        return compact_card("模型服务", "当前没有匹配的模型服务。", template="grey")
+    panels = []
+    healthy = 0
+    for service in services[:20]:
+        runtime = service.get("runtime") or {}
+        if runtime.get("status") == "running" and runtime.get("health") == "healthy":
+            healthy += 1
+        gpu_text = ", ".join("GPU %s" % value for value in service.get("gpu_indices") or []) or "-"
+        details = [
+            "状态 **%s** · 授权 **%d** 人" % (model_runtime_label(runtime), service.get("active_allocations") or 0),
+            "机器 `%s` · %s" % (service.get("worker_name") or service.get("worker_id") or "-", gpu_text),
+            "容器 `%s` · 端口 `%s`" % (service.get("container_name") or "-", service.get("host_port") or "-"),
+        ]
+        resources = []
+        if runtime.get("gpu_memory_used_bytes") is not None:
+            resources.append("显存 %s" % format_bytes(runtime.get("gpu_memory_used_bytes")))
+        if runtime.get("memory_used_bytes") is not None:
+            resources.append("内存 %s" % format_bytes(runtime.get("memory_used_bytes")))
+        if runtime.get("cpu_percent") is not None:
+            resources.append("CPU %s" % format_percent(runtime.get("cpu_percent")))
+        if resources:
+            details.append(" · ".join(resources))
+        panels.append(
+            {
+                "tag": "collapsible_panel",
+                "expanded": False,
+                "header": {
+                    "title": {"tag": "plain_text", "content": str(service.get("served_name") or service.get("model_name"))[:100]},
+                    "icon": {"tag": "standard_icon", "token": "down-small-ccm_outlined", "size": "16px 16px"},
+                    "icon_position": "right",
+                    "icon_expanded_angle": -180,
+                },
+                "border": {"color": "grey", "corner_radius": "5px"},
+                "elements": [{"tag": "markdown", "content": "\n".join(details)}],
+            }
+        )
+    summary = "共 **%d** 个服务 · **%d** 个运行正常" % (len(services), healthy)
+    if payload.get("api_base_url"):
+        summary += "\nAPI 地址 `%s`" % payload.get("api_base_url")
+    return {
+        "schema": "2.0",
+        "config": {"width_mode": "fill", "enable_forward": False},
+        "header": {"template": "green" if healthy == len(services) else "orange", "title": {"tag": "plain_text", "content": "模型服务状态"}},
+        "body": {"elements": [{"tag": "markdown", "content": summary}, *panels]},
+    }
+
+
 def callback_button(label, action, request_id, button_type):
     return {
         "tag": "button",
@@ -1451,24 +1623,42 @@ def pending_requests_card(requests):
         return compact_card("待审批申请", "当前没有待处理申请。", template="green")
     panels = []
     for item in requests[:15]:
-        details = (
-            "姓名 **%s** · 类型 **%s**\n机器 `%s` · 账号 `%s`\n模型/任务 %s · 时长 %s 小时\n%s"
-            % (
-                item.get("owner_name") or item.get("requester_display_name") or item.get("requester"),
-                "长期" if item.get("request_type") == "access" else "临时",
-                item.get("target_machine_label") or item.get("target_machine") or "待分配",
-                item.get("requested_account") or "自动生成",
-                item.get("model_name") or "-",
-                item.get("duration_hours") or "-",
-                item.get("purpose") or "",
+        is_model = item.get("access_type") == "api" and bool(item.get("model_key"))
+        owner = item.get("owner_name") or item.get("requester_display_name") or item.get("requester")
+        if is_model:
+            details = (
+                "姓名 **%s** · 类型 **模型 API**\n模型 `%s` · GPU %s 张\n时长 %s 小时\n%s"
+                % (
+                    owner,
+                    item.get("model_name") or item.get("model_key") or "-",
+                    item.get("gpu_count") or "自动",
+                    item.get("duration_hours") or "-",
+                    item.get("purpose") or "",
+                )
             )
-        )
+            approve_label = "通过并部署"
+            approve_action = "approve_model_request"
+        else:
+            details = (
+                "姓名 **%s** · 类型 **%s**\n机器 `%s` · 账号 `%s`\n模型/任务 %s · 时长 %s 小时\n%s"
+                % (
+                    owner,
+                    "长期" if item.get("request_type") == "access" else "临时",
+                    item.get("target_machine_label") or item.get("target_machine") or "待分配",
+                    item.get("requested_account") or "自动生成",
+                    item.get("model_name") or "-",
+                    item.get("duration_hours") or "-",
+                    item.get("purpose") or "",
+                )
+            )
+            approve_label = "通过并开通"
+            approve_action = "approve_request"
         panels.append(
             {
                 "tag": "collapsible_panel",
                 "expanded": False,
                 "header": {
-                    "title": {"tag": "plain_text", "content": "#%s · %s" % (item.get("id"), item.get("owner_name") or item.get("requester"))},
+                    "title": {"tag": "plain_text", "content": "#%s · %s" % (item.get("id"), owner)},
                     "icon": {"tag": "standard_icon", "token": "down-small-ccm_outlined", "size": "16px 16px"},
                     "icon_position": "right",
                     "icon_expanded_angle": -180,
@@ -1480,7 +1670,7 @@ def pending_requests_card(requests):
                         "tag": "column_set",
                         "flex_mode": "bisect",
                         "columns": [
-                            {"tag": "column", "width": "weighted", "weight": 1, "elements": [callback_button("通过并开通", "approve_request", item.get("id"), "primary")]},
+                            {"tag": "column", "width": "weighted", "weight": 1, "elements": [callback_button(approve_label, approve_action, item.get("id"), "primary")]},
                             {"tag": "column", "width": "weighted", "weight": 1, "elements": [callback_button("拒绝", "reject_request", item.get("id"), "danger")]},
                         ],
                     },
@@ -1493,7 +1683,7 @@ def pending_requests_card(requests):
         "header": {"template": "orange", "title": {"tag": "plain_text", "content": "待审批申请"}},
         "body": {
             "elements": [
-                {"tag": "markdown", "content": "共 **%d** 条待处理；展开后确认机器和账号。" % len(requests)},
+                {"tag": "markdown", "content": "共 **%d** 条待处理；展开后确认资源和用途。" % len(requests)},
                 *panels,
             ]
         },
@@ -1655,6 +1845,42 @@ class FeishuResourceBot:
             "notes": "Submitted through Feishu bot",
         }
 
+    def model_request_payload(self, form):
+        model_key = form.get("model_key", "").strip()
+        owner_name = form.get("owner_name", "").strip()
+        purpose = form.get("purpose", "").strip()
+        if not model_key or not owner_name or not purpose:
+            raise ValueError("模型、姓名和用途不能为空")
+        try:
+            duration = int(form.get("duration_hours") or 0)
+            gpu_count = int(form.get("gpu_count") or 0)
+        except ValueError:
+            raise ValueError("时长和 GPU 数量必须是整数") from None
+        if duration < 1 or duration > 720:
+            raise ValueError("使用时长必须在 1 到 720 小时之间")
+        if gpu_count not in (1, 2, 4, 8):
+            raise ValueError("GPU 数量无效")
+        model = next((item for item in self.dashboard.models() if item.get("key") == model_key), None)
+        if not model:
+            raise ValueError("该模型当前未开放部署")
+        return {
+            "request_type": "temporary",
+            "owner_name": owner_name[:80],
+            "model_key": model_key[:240],
+            "model_name": str(model.get("served_model_name") or model.get("name"))[:160],
+            "model_size": "%s GB weights" % (model.get("weight_gib") or 0),
+            "purpose": purpose[:2000],
+            "access_type": "api",
+            "gpu_count": max(gpu_count, int(model.get("recommended_gpu_count") or 1)),
+            "gpu_memory_gb": None,
+            "duration_hours": duration,
+            "target_machine": "",
+            "target_machine_label": "自动调度",
+            "requested_account": "",
+            "requested_password": "",
+            "notes": "Submitted through Feishu model service form",
+        }
+
     def on_card_action(self, data):
         event = data.event
         operator = getattr(event, "operator", None)
@@ -1678,7 +1904,26 @@ class FeishuResourceBot:
                     except Exception:
                         pass
                 return self.callback_response("申请 #%s 已提交" % request_id)
-            if action_name in ("direct_provision", "approve_request", "reject_request"):
+            if action_name == "submit_model_request":
+                payload = self.model_request_payload(form)
+                request_id = self.workflow.create_request(open_id, chat_id, payload)
+                for admin_open_id in self.admin_open_ids:
+                    try:
+                        self.send_to_open_id(
+                            admin_open_id,
+                            "收到新的模型 API 申请 #%s：%s · %s。发送“待审批”查看。"
+                            % (request_id, payload["owner_name"], payload["model_name"]),
+                        )
+                    except Exception:
+                        pass
+                return self.callback_response("模型申请 #%s 已提交" % request_id)
+            if action_name in (
+                "direct_provision",
+                "approve_request",
+                "approve_model_request",
+                "direct_model_deploy",
+                "reject_request",
+            ):
                 if not self.is_admin(open_id):
                     return self.callback_response("仅管理员可以执行此操作", success=False)
                 job = {"action": action_name, "operator_open_id": open_id, "form": form}
@@ -1693,6 +1938,22 @@ class FeishuResourceBot:
             return self.callback_response("提交失败，请稍后重试", success=False)
 
     def result_text(self, result):
+        credential = result.get("credential") or {}
+        service = result.get("service") or {}
+        allocation = result.get("allocation") or {}
+        if credential:
+            lines = [
+                "模型 API 已开通%s" % ("（复用现有服务）" if result.get("reused") else ""),
+                "模型：%s" % (credential.get("model") or service.get("served_name") or "-"),
+                "机器：%s" % (service.get("worker_name") or service.get("worker_id") or "-"),
+                "GPU：%s" % (", ".join("GPU %s" % value for value in service.get("gpu_indices") or []) or "-"),
+                "Base URL：%s" % (credential.get("base_url") or "-"),
+                "API Key：%s" % (credential.get("api_key") or "-"),
+                "到期：%s" % (credential.get("expires_at") or allocation.get("expires_at") or "长期有效"),
+            ]
+            if credential.get("access_hint"):
+                lines.append("连接：%s" % credential.get("access_hint"))
+            return "\n".join(lines)
         account = result.get("account") or {}
         if account:
             return (
@@ -1748,6 +2009,25 @@ class FeishuResourceBot:
                     context = self.workflow.request_context(request_id)
                     if context and context.get("open_id") != job["operator_open_id"]:
                         self.send_to_open_id(context["open_id"], message)
+                elif action == "direct_model_deploy":
+                    payload = self.model_request_payload(job["form"])
+                    result = self.dashboard.deploy_model(
+                        {
+                            "model_key": payload["model_key"],
+                            "owner_name": payload["owner_name"],
+                            "duration_hours": payload["duration_hours"],
+                            "gpu_count": payload["gpu_count"],
+                        }
+                    )
+                    self.send_to_open_id(job["operator_open_id"], self.result_text(result or {}))
+                elif action == "approve_model_request":
+                    request_id = int(job["request_id"])
+                    result = self.dashboard.deploy_requested_model(request_id)
+                    message = self.result_text(result or {})
+                    self.send_to_open_id(job["operator_open_id"], message)
+                    context = self.workflow.request_context(request_id)
+                    if context and context.get("open_id") != job["operator_open_id"]:
+                        self.send_to_open_id(context["open_id"], message)
                 elif action == "reject_request":
                     request_id = int(job["request_id"])
                     self.dashboard.post(
@@ -1762,7 +2042,8 @@ class FeishuResourceBot:
             except Exception as exc:
                 print("account job failed: %s" % type(exc).__name__, flush=True)
                 try:
-                    self.send_to_open_id(job.get("operator_open_id"), "账号操作失败，请到网页管理后台检查。")
+                    operation = "模型操作" if "model" in str(job.get("action") or "") else "账号操作"
+                    self.send_to_open_id(job.get("operator_open_id"), "%s失败：%s" % (operation, str(exc)[:300]))
                 except Exception:
                     pass
             finally:
@@ -1821,6 +2102,20 @@ class FeishuResourceBot:
                 return answer, compact_card("无管理员权限", answer, template="red")
             answer = "请在卡片中填写开通信息。"
             return answer, account_form_card(self.dashboard.machines(), direct=True)
+        if command == "request_model":
+            models = self.dashboard.models()
+            answer = "请在卡片中选择模型并填写用途。"
+            return answer, model_form_card(models, direct=False)
+        if command == "model_status":
+            payload = self.dashboard.model_services(plan.get("argument") or "")
+            return model_services_text(payload), model_services_card(payload)
+        if command == "deploy_model":
+            if not self.is_admin(sender_id):
+                answer = "仅管理员可以直接部署模型；你可以发送“申请模型”。"
+                return answer, compact_card("无管理员权限", answer, template="red")
+            models = self.dashboard.models()
+            answer = "请在卡片中选择要部署的目录模型。"
+            return answer, model_form_card(models, direct=True)
         if command == "admin_disabled":
             answer = "该写操作尚未开放，请使用“申请账号”“待审批”或“开通账号”。"
             return answer, compact_card("操作尚未开放", answer, template="orange")

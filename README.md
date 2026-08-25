@@ -137,6 +137,18 @@ PROBE_MODEL_DEPLOYMENT_ROOT=/mnt/bnu-model-nas/yaozhi/models
 PROBE_MODEL_CATALOG_CACHE_SECONDS=300
 ```
 
+## Managed Model Services
+
+The optional managed-service workflow connects the enabled model catalog to vLLM workers and an existing One API SQLite deployment. It keeps model-service instances separate from per-user API allocations, so an already-running model is reused while each approved requester receives an independently restricted and expiring token.
+
+Copy `config/model-deployments.example.json` to an ignored private configuration file and set:
+
+```ini
+PROBE_MODEL_DEPLOYMENT_CONFIG=/opt/server-probe-dashboard/config/model-deployments.json
+```
+
+Only administrators can deploy directly or approve a model request. The generated API key is returned once by the protected deployment endpoint and is sent by the Feishu bot as a private message; list and status APIs never include token secrets. Worker model roots, GPU allowlists, Docker images, port ranges, One API database paths, and optional pre-existing seed services are all configured outside Git.
+
 `PROBE_MODEL_CATALOG_ROOT` is the path visible to the dashboard host. `PROBE_MODEL_DEPLOYMENT_ROOT` is the corresponding read-only path on deployment workers. Verification and enablement settings are stored in PostgreSQL; NAS credentials and model contents are not stored in the database or returned to normal users.
 
 Admins can change any dashboard user's password, and users can change their own password after entering the current password. Password changes can also be synced to machine accounts with the same username recorded in the machine-account index; the dashboard updates those machines through the same root or sudo-capable provisioning credentials.

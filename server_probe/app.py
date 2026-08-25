@@ -27,6 +27,7 @@ import paramiko
 from server_probe.auth import AuthStore, utc_now
 from server_probe.history import HistoryStore
 from server_probe.model_catalog import ModelCatalog
+from server_probe.model_services import ModelServiceManager, load_model_service_config
 from server_probe.notifications import AlertNotificationManager, FeishuWebhookClient
 from server_probe.usage_reports import HourlyUsageReporter, current_user_usage, group_usage_rows, rank_usage_people
 
@@ -1467,6 +1468,54 @@ class Monitor:
             raise RuntimeError(self.redact((completed.stderr or completed.stdout or error_message).strip()))
         return json.loads(completed.stdout.strip().splitlines()[-1])
 
+    def run_remote_root_script(self, server_id, script, timeout=60, error_message="remote command failed"):
+        server = self.get_server(server_id)
+        if not server:
+            raise ValueError("target machine not found")
+        target = self.provision_target(server)
+        if target.get("connection") == "local":
+            return self.run_local_root_script(script, timeout=timeout, error_message=error_message)
+
+        jump_client = None
+        client = None
+        try:
+            sock = None
+            if target.get("jump"):
+                jump = target["jump"]
+                jump_client = self.open_client(
+                    host=jump["host"],
+                    port=int(jump.get("port", 22)),
+                    user=jump["user"],
+                    password=self.resolve_password(jump),
+                    timeout=self.server_timeout(jump, "connect_timeout_seconds", self.connect_timeout),
+                )
+                transport = jump_client.get_transport()
+                sock = transport.open_channel(
+                    "direct-tcpip",
+                    (target["host"], int(target.get("port", 22))),
+                    ("127.0.0.1", 0),
+                )
+            client = self.open_client(
+                host=target["host"],
+                port=int(target.get("port", 22)),
+                user=target["user"],
+                password=self.resolve_password(target),
+                sock=sock,
+                timeout=self.server_timeout(target, "connect_timeout_seconds", self.connect_timeout),
+            )
+            return self.execute_root_python(
+                client,
+                self.resolve_password(target),
+                script,
+                timeout=timeout,
+                error_message=error_message,
+            )
+        finally:
+            if client is not None:
+                client.close()
+            if jump_client is not None:
+                jump_client.close()
+
     def run_remote_provisioner(self, server, payload):
         target = self.provision_target(server)
         if target.get("connection") == "local":
@@ -1635,6 +1684,7 @@ def load_config(path):
 class DashboardHandler(BaseHTTPRequestHandler):
     monitor = None
     model_catalog = None
+    model_service_manager = None
     auth_enabled = False
     auth_store = None
     cookie_secure_mode = "never"
@@ -1799,6 +1849,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         model = next((item for item in payload["models"] if item.get("key") == model_key), None)
         self.send_json({"setting": setting, "model": model})
 
+    def model_services_payload(self, user, model_ref=""):
+        if self.model_service_manager is None:
+            return {"enabled": False, "services": [], "generated_at": utc_now_iso()}
+        return self.model_service_manager.list_services(user=user, model_ref=model_ref)
+
     def client_ip(self):
         return request_client_ip(self.client_address[0], self.headers.get("X-Real-IP", ""))
 
@@ -1883,6 +1938,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         target_machine_label = self.monitor.request_machine_label(target_machine) if target_machine else ""
         requested_account = str(data.get("requested_account") or "").strip()
         requested_password = str(data.get("requested_password") or "")
+        model_key = str(data.get("model_key") or "").strip()
         model_name = str(data.get("model_name") or "").strip()
         purpose = str(data.get("purpose") or "").strip()
         gpu_count = int(as_number(data.get("gpu_count")) or 0)
@@ -1891,11 +1947,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
         duration_hours = int(as_number(data.get("duration_hours")) or 0)
         if duration_hours <= 0:
             duration_hours = None
+        access_type = str(data.get("access_type") or "ssh").strip()
+        if access_type not in ("ssh", "api", "both"):
+            raise ValueError("invalid access type")
         if request_type == "temporary":
             if not model_name or not purpose:
                 raise ValueError("model name and purpose are required")
             if duration_hours is None:
                 raise ValueError("duration is required for temporary requests")
+            if access_type == "api":
+                if self.model_service_manager is None or not self.model_service_manager.enabled:
+                    raise ValueError("managed model deployment is unavailable")
+                candidates = self.model_service_manager.catalog_models()
+                if not model_key:
+                    reference = model_name.casefold()
+                    match = next(
+                        (
+                            model
+                            for model in candidates
+                            if reference in {
+                                str(model.get("key") or "").casefold(),
+                                str(model.get("name") or "").casefold(),
+                                str(model.get("served_model_name") or "").casefold(),
+                            }
+                        ),
+                        None,
+                    )
+                    model_key = str((match or {}).get("key") or "")
+                model = self.model_service_manager.model_by_key(model_key)
+                model_name = str(model.get("served_model_name") or model.get("name"))
+                if gpu_count <= 0:
+                    gpu_count = max(1, int(model.get("recommended_gpu_count") or 1))
         else:
             if not owner_name:
                 raise ValueError("owner name is required")
@@ -1907,13 +1989,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 model_name = "Long-term access for %s" % requested_account
             if not purpose:
                 purpose = "Long-term machine access request"
+            access_type = "ssh"
         return {
             "request_type": request_type,
             "owner_name": owner_name[:80],
+            "model_key": model_key[:240],
             "model_name": model_name[:160],
             "model_size": str(data.get("model_size") or "").strip()[:80],
             "purpose": purpose[:2000],
-            "access_type": str(data.get("access_type") or "ssh").strip()[:20],
+            "access_type": access_type,
             "gpu_count": gpu_count,
             "gpu_memory_gb": rounded(data.get("gpu_memory_gb")),
             "duration_hours": duration_hours,
@@ -1980,6 +2064,91 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "request not found"}, status=404)
             return
         self.send_json({"ok": True, "request": updated})
+
+    def model_deployment_note(self, result):
+        service = result.get("service") or {}
+        allocation = result.get("allocation") or {}
+        credential = result.get("credential") or {}
+        return "\n".join(
+            [
+                "service_id=%s" % (service.get("id") or ""),
+                "model=%s" % (service.get("served_name") or ""),
+                "machine=%s" % (service.get("worker_name") or service.get("worker_id") or ""),
+                "gpus=%s" % ",".join(service.get("gpu_indices") or []),
+                "base_url=%s" % (credential.get("base_url") or ""),
+                "expires_at=%s" % (allocation.get("expires_at") or ""),
+            ]
+        )
+
+    def deploy_model_service(self, user, request=None):
+        if not self.require_admin(user):
+            return
+        if self.model_service_manager is None or not self.model_service_manager.enabled:
+            self.send_json({"error": "managed model deployment is unavailable"}, status=503)
+            return
+        data = self.read_json_body(limit=32768)
+        source = request or {}
+        model_key = str(data.get("model_key") or source.get("model_key") or "").strip()
+        requester_id = source.get("requester_id") or user.get("id")
+        owner_name = str(
+            data.get("owner_name")
+            or source.get("owner_name")
+            or source.get("requester_display_name")
+            or source.get("requester")
+            or user.get("display_name")
+            or user.get("username")
+        ).strip()
+        duration_hours = data.get("duration_hours") or source.get("duration_hours") or 24
+        gpu_count = data.get("gpu_count")
+        if gpu_count in (None, ""):
+            gpu_count = source.get("gpu_count")
+        request_id = source.get("id")
+        try:
+            result = self.model_service_manager.deploy(
+                model_key=model_key,
+                requester_id=requester_id,
+                owner_name=owner_name,
+                duration_hours=duration_hours,
+                gpu_count=gpu_count,
+                request_id=request_id,
+                created_by=user.get("id"),
+            )
+            if request_id:
+                updated = self.auth_store.update_model_request(
+                    request_id,
+                    user["id"],
+                    "allocated",
+                    admin_note=str(data.get("admin_note") or source.get("admin_note") or "")[:3000],
+                    allocation_note=self.model_deployment_note(result),
+                )
+                result["request"] = updated
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        except Exception as exc:
+            self.send_json({"error": self.monitor.redact(str(exc)) or "model deployment failed"}, status=500)
+            return
+        self.send_json({"ok": True, **result}, status=201)
+
+    def deploy_request_model(self, route, user):
+        if not self.require_admin(user):
+            return
+        try:
+            request_id = int(route.split("/")[-2])
+        except Exception:
+            self.send_json({"error": "invalid request id"}, status=400)
+            return
+        request = self.auth_store.get_model_request(request_id, include_secret=False)
+        if not request:
+            self.send_json({"error": "request not found"}, status=404)
+            return
+        if request.get("access_type") != "api" or not request.get("model_key"):
+            self.send_json({"error": "request is not a managed model API request"}, status=400)
+            return
+        if request.get("status") == "rejected":
+            self.send_json({"error": "request has been rejected"}, status=409)
+            return
+        self.deploy_model_service(user, request=request)
 
     def create_user(self, user):
         if not self.require_admin(user):
@@ -2358,6 +2527,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, status=503)
             return
 
+        if route == "/api/model-services":
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.send_json(self.model_services_payload(user, model_ref=query.get("q", [""])[0]))
+            return
+
         if route == "/api/users":
             if not self.auth_enabled:
                 self.send_json({"error": "authentication is disabled"}, status=404)
@@ -2520,6 +2696,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "authentication is disabled"}, status=404)
                 return
             self.provision_request_account(route, user)
+            return
+
+        if route.startswith("/api/resource-requests/") and route.endswith("/deploy-model"):
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.deploy_request_model(route, user)
+            return
+
+        if route == "/api/model-services/deploy":
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.deploy_model_service(user)
             return
 
         if route == "/api/provision-account":
@@ -2703,6 +2893,19 @@ def main(argv=None):
         notification_manager=notification_manager,
         usage_reporter=usage_reporter,
     )
+    deployment_config_path = os.getenv("PROBE_MODEL_DEPLOYMENT_CONFIG", "").strip()
+    deployment_config = load_model_service_config(deployment_config_path) if deployment_config_path else {"enabled": False}
+    DashboardHandler.model_service_manager = ModelServiceManager(
+        DashboardHandler.monitor,
+        DashboardHandler.model_catalog,
+        auth_store,
+        deployment_config,
+    )
+    if DashboardHandler.model_service_manager.enabled:
+        admin_user = auth_store.get_user_by_username("admin") if auth_store else None
+        DashboardHandler.model_service_manager.seed_configured_services(
+            created_by=(admin_user or {}).get("id")
+        )
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     print("Server probe dashboard listening on http://%s:%s" % (args.host, args.port), flush=True)
     server.serve_forever()

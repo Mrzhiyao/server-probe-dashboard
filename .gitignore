@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .env
 config/servers.json
+config/model-deployments.json
 config/*.local.json
 logs/
 
