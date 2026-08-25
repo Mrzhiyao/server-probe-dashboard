@@ -54,6 +54,7 @@ Authentication is disabled by default. To enable it, install the requirements, c
 PROBE_AUTH_ENABLED=1
 PROBE_AUTH_DB_DSN=postgresql://server_probe:change-me@127.0.0.1:5432/server_probe
 PROBE_AUTH_SESSION_HOURS=12
+PROBE_AUTH_COOKIE_SECURE=auto
 ```
 
 Initialize the auth tables and create an admin user:
@@ -65,6 +66,7 @@ python -m server_probe.auth set-password alice --role user --display-name "Alice
 ```
 
 Use HTTPS in front of the dashboard when exposing it beyond a trusted LAN.
+The `auto` cookie mode adds the `Secure` flag for HTTPS reverse-proxy requests while still allowing direct HTTP access on a trusted LAN. Use `1` for HTTPS-only deployments or `0` for HTTP-only deployments.
 When reverse-proxied, the application only accepts `X-Real-IP` from a loopback peer; direct clients cannot override the address used by login rate limiting.
 
 ## Feishu Query Bot

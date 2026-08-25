@@ -125,6 +125,23 @@ def value_bool(value, default=False):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def cookie_secure_mode(value, default=False):
+    if value is None:
+        return "always" if default else "never"
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    return "always" if value_bool(value, default) else "never"
+
+
+def forwarded_request_is_https(headers):
+    proto = str(headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip().lower()
+    if proto:
+        return proto == "https"
+    forwarded = str(headers.get("Forwarded") or "")
+    match = re.search(r"(?:^|[;,])\s*proto\s*=\s*\"?([^\";,\s]+)", forwarded, re.IGNORECASE)
+    return bool(match and match.group(1).lower() == "https")
+
+
 def request_client_ip(peer_address, real_ip_header=""):
     peer = str(peer_address or "").strip()
     try:
@@ -1620,7 +1637,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     model_catalog = None
     auth_enabled = False
     auth_store = None
-    cookie_secure = False
+    cookie_secure_mode = "never"
     login_lock = threading.Lock()
     login_failures = {}
 
@@ -1689,7 +1706,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "HttpOnly",
             "SameSite=Lax",
         ]
-        if self.cookie_secure:
+        secure = self.cookie_secure_mode == "always" or (
+            self.cookie_secure_mode == "auto" and forwarded_request_is_https(self.headers)
+        )
+        if secure:
             parts.append("Secure")
         return "; ".join(parts)
 
@@ -2544,7 +2564,10 @@ def main(argv=None):
     auth_config = config.get("auth") or {}
     auth_enabled = env_bool("PROBE_AUTH_ENABLED", bool(auth_config.get("enabled", False)))
     DashboardHandler.auth_enabled = auth_enabled
-    DashboardHandler.cookie_secure = env_bool("PROBE_AUTH_COOKIE_SECURE", bool(auth_config.get("cookie_secure", False)))
+    cookie_secure_value = os.getenv("PROBE_AUTH_COOKIE_SECURE")
+    if cookie_secure_value is None:
+        cookie_secure_value = auth_config.get("cookie_secure", False)
+    DashboardHandler.cookie_secure_mode = cookie_secure_mode(cookie_secure_value)
     dsn = os.getenv("PROBE_AUTH_DB_DSN") or auth_config.get("postgres_dsn")
     auth_store = None
     if auth_enabled:
