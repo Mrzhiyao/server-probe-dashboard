@@ -21,6 +21,7 @@ A lightweight SSH-based Linux resource dashboard. The dashboard host periodicall
 - Direct SSH and SSH jump-host collection
 - Optional PostgreSQL-backed login and session access control
 - User-submitted temporary account and long-term access requests with admin approval workflow
+- NAS-backed model catalog with architecture, weight-size, quantization, verification, and admin enable/disable controls
 - Secrets read from environment variables, not frontend code or API responses
 
 ## Run
@@ -123,6 +124,18 @@ Logged-in users can submit requests from `/requests`. Normal users see a submit 
 
 Machine account provisioning creates a home directory, sets `/bin/bash` as the login shell, sets the requested or generated password non-interactively, adds the user to the `docker` group, and, when `/disk_*` directories exist, configures a `diskusers` group with group write access on those directories and adds the user to it. Successful provisioning is recorded in the machine-account database index.
 Provisioning also creates or updates a same-name dashboard login account with the same password, preserving an existing user's role.
+
+## Model Catalog
+
+The authenticated request center includes a model-service page backed by an existing mounted model directory. The scanner reads only immediate model metadata and weight-file sizes; it never reads tensor contents. Administrators can verify models, choose the served API name and recommended GPU count, and enable selected models for normal users. Enabled models can be copied directly into the existing API request form.
+
+```ini
+PROBE_MODEL_CATALOG_ROOT=/nas/yaozhi/models
+PROBE_MODEL_DEPLOYMENT_ROOT=/mnt/bnu-model-nas/yaozhi/models
+PROBE_MODEL_CATALOG_CACHE_SECONDS=300
+```
+
+`PROBE_MODEL_CATALOG_ROOT` is the path visible to the dashboard host. `PROBE_MODEL_DEPLOYMENT_ROOT` is the corresponding read-only path on deployment workers. Verification and enablement settings are stored in PostgreSQL; NAS credentials and model contents are not stored in the database or returned to normal users.
 
 Admins can change any dashboard user's password, and users can change their own password after entering the current password. Password changes can also be synced to machine accounts with the same username recorded in the machine-account index; the dashboard updates those machines through the same root or sudo-capable provisioning credentials.
 

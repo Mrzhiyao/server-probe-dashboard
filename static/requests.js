@@ -3,6 +3,7 @@ const state = {
   requests: [],
   machines: [],
   users: [],
+  models: [],
   page: "submit",
   kind: "temporary",
 };
@@ -14,9 +15,15 @@ const els = {
   logoutButton: document.querySelector("#logoutButton"),
   pageTabs: document.querySelector("#pageTabs"),
   submitPage: document.querySelector("#submitPage"),
+  modelsPage: document.querySelector("#modelsPage"),
   reviewPage: document.querySelector("#reviewPage"),
   passwordPage: document.querySelector("#passwordPage"),
   accountsPage: document.querySelector("#accountsPage"),
+  modelCatalog: document.querySelector("#modelCatalog"),
+  modelCatalogSummary: document.querySelector("#modelCatalogSummary"),
+  reloadModelsButton: document.querySelector("#reloadModelsButton"),
+  modelSearch: document.querySelector("#modelSearch"),
+  modelCategory: document.querySelector("#modelCategory"),
   temporaryForm: document.querySelector("#temporaryForm"),
   accessForm: document.querySelector("#accessForm"),
   temporaryMessage: document.querySelector("#temporaryMessage"),
@@ -98,12 +105,183 @@ function formPayload(form) {
 function setPage(page) {
   state.page = page;
   els.submitPage.hidden = page !== "submit";
+  els.modelsPage.hidden = page !== "models";
   els.reviewPage.hidden = page !== "review";
   els.passwordPage.hidden = page !== "password";
   els.accountsPage.hidden = page !== "accounts";
   document.querySelectorAll(".tab-button").forEach((button) => {
     button.classList.toggle("active", button.dataset.page === page);
   });
+}
+
+function modelCategoryText(category) {
+  return {
+    text: "文本",
+    vision: "多模态",
+    embedding: "嵌入",
+    audio: "语音",
+    gguf: "GGUF",
+    other: "其他",
+  }[category] || category || "其他";
+}
+
+function verificationText(status) {
+  return { verified: "已验证", untested: "未验证", blocked: "已阻止" }[status] || status;
+}
+
+function modelMetaHtml(model) {
+  const values = [
+    modelCategoryText(model.category),
+    `${model.weight_gib ?? 0} GB 权重`,
+    model.quantization ? `量化 ${model.quantization}` : "原始精度",
+    `${model.weight_files || 0} 个权重文件`,
+  ];
+  return values.map((value) => `<span>${escapeHtml(value)}</span>`).join("");
+}
+
+function modelAdminControls(model) {
+  if (state.user?.role !== "admin") return "";
+  return `<form class="model-setting-form" data-model-key="${escapeHtml(model.key)}">
+    <label class="checkbox-line model-enable-control">
+      <input name="enabled" type="checkbox"${model.enabled ? " checked" : ""}${!model.candidate ? " disabled" : ""} />
+      对用户开放
+    </label>
+    <label>
+      验证状态
+      <select name="verification_status">
+        ${["untested", "verified", "blocked"]
+          .map((value) => `<option value="${value}"${model.verification_status === value ? " selected" : ""}>${verificationText(value)}</option>`)
+          .join("")}
+      </select>
+    </label>
+    <label>
+      推荐 GPU 数
+      <input name="recommended_gpu_count" type="number" min="0" max="16" value="${escapeHtml(model.recommended_gpu_count ?? 0)}" />
+    </label>
+    <label class="model-served-name">
+      API 模型名
+      <input name="served_model_name" value="${escapeHtml(model.served_model_name || "")}" />
+    </label>
+    <label class="model-notes-field">
+      备注
+      <input name="notes" value="${escapeHtml(model.notes || "")}" placeholder="镜像、上下文或限制" />
+    </label>
+    <button class="button ghost mini-action" type="submit">保存</button>
+  </form>`;
+}
+
+function modelCard(model) {
+  const architecture = (model.architectures || []).join(", ") || model.model_type || "未识别";
+  const stateClass = model.enabled ? "enabled" : model.verification_status === "blocked" ? "blocked" : "disabled";
+  const action =
+    state.user?.role !== "admin" && model.enabled
+      ? `<button class="button model-apply-button" type="button" data-model-key="${escapeHtml(model.key)}">申请此模型</button>`
+      : "";
+  return `<article class="model-catalog-card ${stateClass}" data-model-card="${escapeHtml(model.key)}">
+    <div class="model-card-head">
+      <div>
+        <span class="model-category">${escapeHtml(modelCategoryText(model.category))}</span>
+        <h3>${escapeHtml(model.name)}</h3>
+        <p>${escapeHtml(architecture)}</p>
+      </div>
+      <span class="model-verification ${escapeHtml(model.verification_status)}">${escapeHtml(verificationText(model.verification_status))}</span>
+    </div>
+    <div class="model-meta">${modelMetaHtml(model)}</div>
+    <div class="model-resource-line">
+      <span>建议 <strong>${model.recommended_gpu_count || 0}</strong> GPU</span>
+      <span>API 名称 <code>${escapeHtml(model.served_model_name || "-")}</code></span>
+    </div>
+    ${model.notes ? `<p class="model-note">${escapeHtml(model.notes)}</p>` : ""}
+    ${!model.candidate ? `<p class="model-warning">该目录不属于当前 vLLM 对话服务候选。</p>` : ""}
+    ${modelAdminControls(model)}
+    ${action}
+  </article>`;
+}
+
+function filteredModels() {
+  const query = (els.modelSearch.value || "").trim().toLowerCase();
+  const category = els.modelCategory.value;
+  return state.models.filter((model) => {
+    if (category !== "all" && model.category !== category) return false;
+    if (!query) return true;
+    const text = `${model.name} ${model.model_type || ""} ${(model.architectures || []).join(" ")} ${model.quantization || ""}`.toLowerCase();
+    return text.includes(query);
+  });
+}
+
+function fillModelRequest(model) {
+  const form = els.temporaryForm;
+  const gpuCount = Math.max(1, Number(model.recommended_gpu_count || 1));
+  const estimatedPerGpu = Math.ceil(((Number(model.weight_gib || 0) * 1.2 + 2) / gpuCount) * 2) / 2;
+  form.elements.model_name.value = model.served_model_name || model.name;
+  form.elements.model_size.value = `${model.weight_gib || 0} GB 权重`;
+  form.elements.access_type.value = "api";
+  form.elements.gpu_count.value = gpuCount;
+  form.elements.gpu_memory_gb.value = Math.max(8, estimatedPerGpu);
+  form.elements.duration_hours.value = 24;
+  form.elements.purpose.value = `申请部署 ${model.name} 的 API 服务`;
+  form.elements.notes.value = `目录模型：${model.name}`;
+  setKind("temporary");
+  setPage("submit");
+  showToast("模型信息已带入申请表");
+}
+
+function bindModelCatalogActions() {
+  document.querySelectorAll(".model-apply-button").forEach((button) => {
+    button.addEventListener("click", () => {
+      const model = state.models.find((item) => item.key === button.dataset.modelKey);
+      if (model) fillModelRequest(model);
+    });
+  });
+  document.querySelectorAll(".model-setting-form").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = form.querySelector("button[type='submit']");
+      button.disabled = true;
+      try {
+        const payload = {
+          enabled: Boolean(form.elements.enabled?.checked),
+          verification_status: form.elements.verification_status.value,
+          recommended_gpu_count: Number(form.elements.recommended_gpu_count.value || 0),
+          served_model_name: form.elements.served_model_name.value,
+          notes: form.elements.notes.value,
+        };
+        await fetchJson(`/api/model-catalog/${encodeURIComponent(form.dataset.modelKey)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        showToast("模型设置已保存");
+        await loadModels(false);
+      } catch (error) {
+        showToast(error.message || "模型设置保存失败", true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+}
+
+function renderModels() {
+  const models = filteredModels();
+  els.modelCatalog.innerHTML = models.length ? models.map(modelCard).join("") : `<div class="empty">没有匹配的模型</div>`;
+  bindModelCatalogActions();
+}
+
+async function loadModels(force = false) {
+  els.reloadModelsButton.disabled = true;
+  try {
+    const payload = await fetchJson(`/api/model-catalog${force ? "?force=1" : ""}`);
+    state.models = payload.models || [];
+    const enabled = state.models.filter((model) => model.enabled).length;
+    els.modelCatalogSummary.textContent = state.user?.role === "admin" ? `${state.models.length} 个目录 · ${enabled} 个已开放` : `${enabled} 个模型可申请`;
+    renderModels();
+  } catch (error) {
+    els.modelCatalog.innerHTML = `<div class="error-box">${escapeHtml(error.message || "模型目录读取失败")}</div>`;
+    els.modelCatalogSummary.textContent = "模型目录不可用";
+  } finally {
+    els.reloadModelsButton.disabled = false;
+  }
 }
 
 function setKind(kind) {
@@ -521,6 +699,7 @@ async function start() {
   if (els.ownerName) els.ownerName.value = currentDisplayName();
   await loadMachines();
   await loadRequests();
+  await loadModels(false);
 
   if (state.user.role === "admin") {
     document.querySelectorAll("[data-admin-only]").forEach((element) => {
@@ -653,6 +832,9 @@ els.passwordForm.addEventListener("submit", async (event) => {
   }
 });
 els.reloadButton.addEventListener("click", loadRequests);
+els.reloadModelsButton.addEventListener("click", () => loadModels(state.user?.role === "admin"));
+els.modelSearch.addEventListener("input", renderModels);
+els.modelCategory.addEventListener("change", renderModels);
 els.logoutButton.addEventListener("click", async () => {
   await fetch("/api/auth/logout", { method: "POST", cache: "no-store" }).catch(() => {});
   window.location.href = "/login";

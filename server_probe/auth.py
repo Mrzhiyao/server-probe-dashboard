@@ -154,6 +154,20 @@ class AuthStore:
                     )
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS probe_model_catalog_settings (
+                      model_key TEXT PRIMARY KEY,
+                      enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                      served_model_name TEXT,
+                      recommended_gpu_count INTEGER NOT NULL DEFAULT 1,
+                      verification_status TEXT NOT NULL DEFAULT 'untested',
+                      notes TEXT,
+                      updated_by BIGINT REFERENCES probe_users(id) ON DELETE SET NULL,
+                      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
                 cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS probe_machine_accounts_username_machine_idx ON probe_machine_accounts(username, machine_key)")
                 cur.execute("CREATE INDEX IF NOT EXISTS probe_sessions_user_id_idx ON probe_sessions(user_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS probe_sessions_expires_at_idx ON probe_sessions(expires_at)")
@@ -297,6 +311,76 @@ class AuthStore:
                 )
                 row = cur.fetchone()
                 return self.user_dict(row) if row else None
+
+    def model_catalog_settings(self):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT model_key, enabled, served_model_name, recommended_gpu_count,
+                           verification_status, notes, updated_at
+                    FROM probe_model_catalog_settings
+                    ORDER BY lower(model_key)
+                    """
+                )
+                rows = cur.fetchall()
+        return {
+            row[0]: {
+                "enabled": bool(row[1]),
+                "served_model_name": row[2],
+                "recommended_gpu_count": row[3],
+                "verification_status": row[4],
+                "notes": row[5],
+                "updated_at": row[6].isoformat() if row[6] else None,
+            }
+            for row in rows
+        }
+
+    def update_model_catalog_setting(self, model_key, admin_id, data):
+        model_key = str(model_key or "").strip()
+        if not model_key or len(model_key) > 240:
+            raise ValueError("invalid model key")
+        verification_status = str(data.get("verification_status") or "untested")
+        if verification_status not in ("untested", "verified", "blocked"):
+            raise ValueError("invalid verification status")
+        try:
+            gpu_count = max(0, min(int(data.get("recommended_gpu_count") or 0), 16))
+        except (TypeError, ValueError):
+            raise ValueError("invalid recommended GPU count") from None
+        served_model_name = str(data.get("served_model_name") or "").strip()[:200] or None
+        notes = str(data.get("notes") or "").strip()[:1000] or None
+        enabled = bool(data.get("enabled")) and verification_status != "blocked"
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO probe_model_catalog_settings (
+                      model_key, enabled, served_model_name, recommended_gpu_count,
+                      verification_status, notes, updated_by, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT (model_key) DO UPDATE SET
+                      enabled = EXCLUDED.enabled,
+                      served_model_name = EXCLUDED.served_model_name,
+                      recommended_gpu_count = EXCLUDED.recommended_gpu_count,
+                      verification_status = EXCLUDED.verification_status,
+                      notes = EXCLUDED.notes,
+                      updated_by = EXCLUDED.updated_by,
+                      updated_at = now()
+                    RETURNING model_key, enabled, served_model_name, recommended_gpu_count,
+                              verification_status, notes, updated_at
+                    """,
+                    (model_key, enabled, served_model_name, gpu_count, verification_status, notes, admin_id),
+                )
+                row = cur.fetchone()
+        return {
+            "model_key": row[0],
+            "enabled": bool(row[1]),
+            "served_model_name": row[2],
+            "recommended_gpu_count": row[3],
+            "verification_status": row[4],
+            "notes": row[5],
+            "updated_at": row[6].isoformat() if row[6] else None,
+        }
 
     def update_existing_password(self, username, password):
         username = str(username or "").strip()

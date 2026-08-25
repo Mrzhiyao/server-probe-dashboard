@@ -26,6 +26,7 @@ import paramiko
 
 from server_probe.auth import AuthStore, utc_now
 from server_probe.history import HistoryStore
+from server_probe.model_catalog import ModelCatalog
 from server_probe.notifications import AlertNotificationManager, FeishuWebhookClient
 from server_probe.usage_reports import HourlyUsageReporter, current_user_usage, group_usage_rows, rank_usage_people
 
@@ -1616,6 +1617,7 @@ def load_config(path):
 
 class DashboardHandler(BaseHTTPRequestHandler):
     monitor = None
+    model_catalog = None
     auth_enabled = False
     auth_store = None
     cookie_secure = False
@@ -1732,6 +1734,50 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return True
         self.send_json({"error": "dashboard permission required"}, status=403)
         return False
+
+    def model_catalog_payload(self, user, force=False):
+        if self.model_catalog is None:
+            return {"models": [], "enabled_count": 0, "available": False}
+        overrides = self.auth_store.model_catalog_settings() if self.auth_enabled else {}
+        models = self.model_catalog.scan(overrides, force=force)
+        is_admin = self.is_admin(user)
+        if not is_admin:
+            models = [model for model in models if model.get("enabled")]
+            for model in models:
+                model.pop("deployment_path", None)
+        status = self.model_catalog.status()
+        if not is_admin:
+            status.pop("source_root", None)
+            status.pop("deployment_root", None)
+        return {
+            "models": models,
+            "enabled_count": sum(1 for model in models if model.get("enabled")),
+            "available": bool(status.get("source_available")),
+            "status": status,
+        }
+
+    def update_model_catalog(self, route, user):
+        if not self.require_admin(user):
+            return
+        if self.model_catalog is None or not self.auth_enabled:
+            self.send_json({"error": "model catalog is unavailable"}, status=503)
+            return
+        model_key = urllib.parse.unquote(route[len("/api/model-catalog/") :]).strip()
+        overrides = self.auth_store.model_catalog_settings()
+        known = {model.get("key") for model in self.model_catalog.scan(overrides)}
+        if model_key not in known:
+            self.send_json({"error": "model not found"}, status=404)
+            return
+        data = self.read_json_body()
+        data["enabled"] = value_bool(data.get("enabled"), False)
+        try:
+            setting = self.auth_store.update_model_catalog_setting(model_key, user["id"], data)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        payload = self.model_catalog_payload(user, force=True)
+        model = next((item for item in payload["models"] if item.get("key") == model_key), None)
+        self.send_json({"setting": setting, "model": model})
 
     def client_ip(self):
         return request_client_ip(self.client_address[0], self.headers.get("X-Real-IP", ""))
@@ -2281,6 +2327,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"machines": self.monitor.request_machines()})
             return
 
+        if route == "/api/model-catalog":
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            force = query.get("force", ["0"])[0] == "1" and self.is_admin(user)
+            try:
+                self.send_json(self.model_catalog_payload(user, force=force))
+            except RuntimeError as exc:
+                self.send_json({"error": str(exc)}, status=503)
+            return
+
         if route == "/api/users":
             if not self.auth_enabled:
                 self.send_json({"error": "authentication is disabled"}, status=404)
@@ -2415,6 +2472,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "resource query unavailable"}, status=503)
                 return
             self.send_json(payload)
+            return
+
+        if route.startswith("/api/model-catalog/"):
+            if not self.auth_enabled:
+                self.send_json({"error": "authentication is disabled"}, status=404)
+                return
+            self.update_model_catalog(route, user)
             return
 
         if route == "/api/resource-requests":
@@ -2591,6 +2655,25 @@ def main(argv=None):
             ),
         )
 
+    model_catalog_config = config.get("model_catalog") or {}
+    model_catalog_root = os.getenv(
+        "PROBE_MODEL_CATALOG_ROOT",
+        model_catalog_config.get("source_root", "/nas/yaozhi/models"),
+    )
+    model_deployment_root = os.getenv(
+        "PROBE_MODEL_DEPLOYMENT_ROOT",
+        model_catalog_config.get("deployment_root", "/mnt/bnu-model-nas/yaozhi/models"),
+    )
+    DashboardHandler.model_catalog = ModelCatalog(
+        model_catalog_root,
+        model_deployment_root,
+        cache_seconds=configured_number(
+            "PROBE_MODEL_CATALOG_CACHE_SECONDS",
+            model_catalog_config,
+            "cache_seconds",
+            300,
+        ),
+    )
     DashboardHandler.monitor = Monitor(
         config,
         history_store=history_store,

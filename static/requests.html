@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Request Center - Server Probe Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260611-permissions" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260825-models" />
   </head>
   <body>
     <div class="app-shell">
@@ -29,6 +29,7 @@
 
       <nav id="pageTabs" class="page-tabs" aria-label="申请中心页面">
         <button class="tab-button" type="button" data-page="submit" data-user-only>提交申请</button>
+        <button class="tab-button" type="button" data-page="models">模型服务</button>
         <button class="tab-button" type="button" data-page="review">我的申请</button>
         <button class="tab-button" type="button" data-page="password">修改密码</button>
         <button class="tab-button" type="button" data-page="accounts" data-admin-only hidden>账号管理</button>
@@ -87,6 +88,37 @@
               <p id="accessMessage" class="form-message"></p>
             </form>
           </div>
+        </section>
+
+        <section id="modelsPage" class="page-view" hidden>
+          <section class="request-panel wide model-catalog-panel">
+            <div class="panel-head">
+              <div>
+                <h2>模型服务</h2>
+                <span id="modelCatalogSummary">正在读取可部署模型</span>
+              </div>
+              <button id="reloadModelsButton" class="button ghost" type="button">刷新目录</button>
+            </div>
+            <div class="model-catalog-toolbar">
+              <label>
+                搜索
+                <input id="modelSearch" type="search" placeholder="模型名称、架构或类型" />
+              </label>
+              <label>
+                类型
+                <select id="modelCategory">
+                  <option value="all">全部</option>
+                  <option value="text">文本模型</option>
+                  <option value="vision">多模态模型</option>
+                  <option value="embedding">嵌入模型</option>
+                  <option value="audio">语音模型</option>
+                  <option value="gguf">GGUF</option>
+                  <option value="other">其他</option>
+                </select>
+              </label>
+            </div>
+            <div id="modelCatalog" class="model-catalog-grid"></div>
+          </section>
         </section>
 
         <section id="reviewPage" class="page-view" hidden>
@@ -174,6 +206,6 @@
         </section>
       </main>
     </div>
-    <script src="/static/requests.js?v=20260611-permissions"></script>
+    <script src="/static/requests.js?v=20260825-models"></script>
   </body>
 </html>
