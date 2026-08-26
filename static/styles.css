@@ -551,6 +551,156 @@ summary:focus-visible {
   min-width: 0;
 }
 
+.model-deployment-panel {
+  margin-bottom: 14px;
+}
+
+.model-deploy-form {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.5fr) minmax(150px, 0.8fr) minmax(110px, 0.45fr) minmax(140px, 0.55fr);
+  gap: 10px;
+  align-items: end;
+}
+
+.model-deploy-form label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.model-deploy-form input,
+.model-deploy-form select {
+  width: 100%;
+  min-width: 0;
+}
+
+.model-deploy-purpose {
+  grid-column: span 3;
+}
+
+.model-deploy-submit {
+  min-height: 43px;
+}
+
+.model-service-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.model-service-list > .empty,
+.model-service-list > .error-box {
+  grid-column: 1 / -1;
+}
+
+.model-service-card {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #171b1f;
+  padding: 14px;
+}
+
+.model-service-card.running {
+  border-color: rgba(111, 211, 155, 0.5);
+}
+
+.model-service-card.deploying {
+  border-color: rgba(240, 190, 91, 0.58);
+}
+
+.model-service-card.failed {
+  border-color: rgba(239, 112, 121, 0.58);
+}
+
+.model-service-card.deploying .state-pill {
+  background: var(--amber);
+}
+
+.model-service-card.failed .state-pill {
+  color: var(--text);
+  background: var(--red);
+}
+
+.model-service-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.model-service-head > div {
+  min-width: 0;
+}
+
+.model-service-head h3 {
+  margin: 0 0 5px;
+  overflow-wrap: anywhere;
+  font-size: 1rem;
+}
+
+.model-service-head p,
+.model-service-error {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.model-service-progress {
+  height: 8px;
+  margin-top: 14px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: #343940;
+}
+
+.model-service-progress > div {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--green);
+  transition: width 220ms ease;
+}
+
+.model-service-card.deploying .model-service-progress > div {
+  background: var(--amber);
+}
+
+.model-service-card.failed .model-service-progress > div {
+  background: var(--red);
+}
+
+.model-service-progress-line,
+.model-service-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px 12px;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.model-service-progress-line strong,
+.model-service-meta strong,
+.model-service-meta code {
+  color: var(--text);
+}
+
+.model-service-meta {
+  justify-content: flex-start;
+  margin-top: 12px;
+}
+
+.model-service-error {
+  margin-top: 10px;
+  color: var(--red);
+}
+
 .model-catalog-toolbar {
   display: grid;
   grid-template-columns: minmax(240px, 1fr) minmax(180px, 260px);
@@ -726,12 +876,14 @@ summary:focus-visible {
 @media (max-width: 760px) {
   .model-catalog-toolbar,
   .model-setting-form,
-  .model-resource-line {
+  .model-resource-line,
+  .model-deploy-form {
     grid-template-columns: 1fr;
   }
 
   .model-served-name,
-  .model-notes-field {
+  .model-notes-field,
+  .model-deploy-purpose {
     grid-column: auto;
   }
 }

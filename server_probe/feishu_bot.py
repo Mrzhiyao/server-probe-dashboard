@@ -42,6 +42,7 @@ ALLOWED_INTENTS = {
     "pending_requests",
     "provision_account",
     "request_model",
+    "model_catalog",
     "model_status",
     "deploy_model",
     "admin_disabled",
@@ -76,11 +77,22 @@ def parse_command(text):
         word in compact for word in ("帮我开账号", "我要开账号")
     ):
         return "provision_account", ""
-    if compact in ("申请模型", "模型申请", "申请模型服务", "申请api"):
-        return "request_model", ""
-    if compact in ("模型状态", "模型服务", "查看模型状态", "查询模型状态", "运行中的模型"):
+    if "模型" in compact and any(word in compact for word in ("状态", "运行", "健康", "进度")):
         return "model_status", ""
-    if compact in ("部署模型", "创建模型", "启动模型", "创建模型服务"):
+    if "模型" in compact and any(
+        phrase in compact
+        for phrase in ("哪些模型", "什么模型", "模型列表", "可部署模型", "支持的模型", "会部署模型", "能部署模型")
+    ):
+        return "model_catalog", ""
+    if compact in ("申请模型", "模型申请", "申请模型服务", "申请api") or (
+        "申请" in compact and ("模型" in compact or "api" in compact)
+    ):
+        return "request_model", ""
+    if compact == "模型服务":
+        return "model_status", ""
+    if compact in ("部署模型", "创建模型", "启动模型", "创建模型服务") or (
+        "模型" in compact and any(word in compact for word in ("部署", "创建", "启动"))
+    ):
         return "deploy_model", ""
     for prefix, command in (("查人", "person"), ("查询用户", "person"), ("查机", "machine"), ("查询机器", "machine")):
         if value.startswith(prefix):
@@ -189,7 +201,16 @@ class LLMIntentRouter:
     def plans(self, text, previous=None, inventory=None):
         text = clean_command(text)[:500]
         safety_guard = parse_command(text)
-        if safety_guard[0] == "admin_disabled":
+        if safety_guard[0] in {
+            "admin_disabled",
+            "request_account",
+            "pending_requests",
+            "provision_account",
+            "request_model",
+            "model_catalog",
+            "model_status",
+            "deploy_model",
+        }:
             return [self.fallback_plan(text)]
         if not self.enabled:
             return [self.fallback_plan(text)]
@@ -233,7 +254,7 @@ class LLMIntentRouter:
             "你是设备资源助手的工具规划器，负责理解自然中文、连续追问和一句话中的多个独立问题。"
             "只输出一个 JSON 对象，不要解释；格式是 {\"actions\":[...]}，按用户提问顺序最多输出 3 个动作。"
             "可选 intent：idle_gpu、person、machine、request_account、pending_requests、provision_account、"
-            "request_model、model_status、deploy_model、"
+            "request_model、model_catalog、model_status、deploy_model、"
             "machine_catalog、resource_query、top_users、admin_disabled、help、clarify、chat。"
             "idle_gpu 用于查询机器清单、空闲机器、GPU 容量或按条件找机器。filters 可包含："
             "gpu_count（每台机器的 GPU 张数，整数或 null）、group（机器组或 null）、idle_only（布尔值）、"
@@ -250,6 +271,7 @@ class LLMIntentRouter:
             "top_users 查询本小时资源使用较高的用户；filters.limit 是 1 到 15，filters.resource 可为 all、gpu、memory、machines。"
             "request_account 是普通用户提交申请；pending_requests 是管理员看待审批；provision_account 是管理员主动开账号。"
             "request_model 是用户申请部署目录中已有模型的 API；model_status 查询已部署模型服务，可把模型关键词放 argument；"
+            "model_catalog 查询当前目录中已验证且可以部署的模型清单；"
             "deploy_model 是管理员直接部署模型。"
             "句子明确包含‘部署模型’‘创建模型’‘启动模型’时必须使用 deploy_model，不能因为不知道发送者角色而降级成 request_model；"
             "只有‘申请模型’‘申请模型 API’‘想使用某模型’才使用 request_model，权限由后端另行判断。"
@@ -1529,6 +1551,61 @@ def model_form_card(models, direct=False):
     }
 
 
+def deployable_models_text(models):
+    available = [item for item in models if item.get("enabled") and item.get("candidate")]
+    if not available:
+        return "当前没有已验证并开放的目录模型。"
+    return "当前有 %d 个模型可以部署。" % len(available)
+
+
+def model_category_label(category):
+    return {
+        "text": "文本",
+        "vision": "多模态",
+        "embedding": "嵌入",
+        "audio": "语音",
+        "gguf": "GGUF",
+    }.get(str(category or ""), "其他")
+
+
+def deployable_models_card(models, services_payload=None):
+    available = [item for item in models if item.get("enabled") and item.get("candidate")]
+    if not available:
+        return compact_card("可部署模型", "当前没有已验证并开放的目录模型。", template="orange")
+    services = (services_payload or {}).get("services") or []
+    running = {
+        item.get("model_key"): item
+        for item in services
+        if (item.get("runtime") or {}).get("status") == "running"
+    }
+    sections = []
+    for model in available[:30]:
+        service = running.get(model.get("key"))
+        lines = [
+            "类型 **%s** · 权重 **%s GB**" % (model_category_label(model.get("category")), model.get("weight_gib") or 0),
+            "建议 **%s GPU** · API 名称 `%s`" % (
+                model.get("recommended_gpu_count") or 1,
+                model.get("served_model_name") or model.get("name"),
+            ),
+            "当前 **%s**" % ("已运行，可直接复用" if service else "未运行"),
+        ]
+        if service:
+            lines.append(
+                "机器 `%s` · GPU %s"
+                % (
+                    service.get("worker_name") or service.get("worker_id") or "-",
+                    ", ".join(service.get("gpu_indices") or []) or "-",
+                )
+            )
+        sections.append({"title": str(model.get("name") or model.get("key")), "content": "\n".join(lines)})
+    return compact_card(
+        "可部署模型",
+        "共 **%d** 个已开放模型 · **%d** 个已有运行实例" % (len(available), len(running)),
+        sections,
+        template="blue",
+    )
+
+
 def model_runtime_label(runtime):
     status = str((runtime or {}).get("status") or "unknown")
     health = str((runtime or {}).get("health") or "unknown")
@@ -1540,8 +1617,19 @@ def model_runtime_label(runtime):
         "stopped": "已停止",
         "exited": "已退出",
         "deploying": "部署中",
+        "failed": "部署失败",
     }
     return labels.get(status, status)
+
+
+def model_progress_stage_label(stage):
+    return {
+        "gpu_allocated": "GPU 已分配",
+        "starting_vllm": "正在启动 vLLM",
+        "registering_gateway": "正在注册 OneAPI",
+        "running": "运行正常",
+        "failed": "部署失败",
+    }.get(str(stage or ""), str(stage or "等待调度"))
 
 
 def model_services_text(payload):
@@ -1572,6 +1660,12 @@ def model_services_card(payload):
             "机器 `%s` · %s" % (service.get("worker_name") or service.get("worker_id") or "-", gpu_text),
             "容器 `%s` · 端口 `%s`" % (service.get("container_name") or "-", service.get("host_port") or "-"),
         ]
+        if service.get("status") == "deploying":
+            details.insert(
+                1,
+                "进度 **%d%%** · `%s`"
+                % (service.get("progress_percent") or 0, model_progress_stage_label(service.get("progress_stage"))),
+            )
         resources = []
         if runtime.get("gpu_memory_used_bytes") is not None:
             resources.append("显存 %s" % format_bytes(runtime.get("gpu_memory_used_bytes")))
@@ -1707,7 +1801,7 @@ class FeishuResourceBot:
             base_url=os.getenv("FEISHU_BOT_LLM_BASE_URL"),
             api_key=os.getenv("FEISHU_BOT_LLM_API_KEY"),
             model=os.getenv("FEISHU_BOT_LLM_MODEL"),
-            timeout=os.getenv("FEISHU_BOT_LLM_TIMEOUT_SECONDS", "8"),
+            timeout=os.getenv("FEISHU_BOT_LLM_TIMEOUT_SECONDS", "20"),
         )
         self.client = (
             lark.Client.builder()
@@ -2106,6 +2200,13 @@ class FeishuResourceBot:
             models = self.dashboard.models()
             answer = "请在卡片中选择模型并填写用途。"
             return answer, model_form_card(models, direct=False)
+        if command == "model_catalog":
+            models = self.dashboard.models()
+            services = self.dashboard.model_services()
+            cards = [deployable_models_card(models, services)]
+            if models:
+                cards.append(model_form_card(models, direct=self.is_admin(sender_id)))
+            return deployable_models_text(models), combine_cards(cards)
         if command == "model_status":
             payload = self.dashboard.model_services(plan.get("argument") or "")
             return model_services_text(payload), model_services_card(payload)

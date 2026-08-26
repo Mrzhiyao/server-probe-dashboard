@@ -43,6 +43,22 @@ class FakeStore:
         return list(self.services)
 
 
+class RecordingStore(FakeStore):
+    def __init__(self):
+        super().__init__()
+        self.updates = []
+        self.current = None
+
+    def create_model_service(self, data):
+        self.current = {"id": 1, **data}
+        return dict(self.current)
+
+    def update_model_service(self, service_id, **values):
+        self.updates.append(dict(values))
+        self.current.update(values)
+        return dict(self.current)
+
+
 def worker_result():
     return {
         "id": "worker-1",
@@ -120,6 +136,40 @@ class ModelServiceManagerTests(unittest.TestCase):
         )
         _, indices = manager.select_worker(manager.model_by_key("Qwen-Test"), 1)
         self.assertEqual(indices, ["1"])
+
+    def test_service_creation_persists_real_progress_stages(self):
+        store = RecordingStore()
+        manager = ModelServiceManager(
+            FakeMonitor(worker_result()),
+            FakeCatalog(),
+            store,
+            {
+                "enabled": True,
+                "oneapi": {"server_id": "worker-1", "database_path": "/one-api.db"},
+                "workers": [
+                    {
+                        "server_id": "worker-1",
+                        "name": "GPU worker",
+                        "model_root": "/models",
+                        "image": "vllm:test",
+                    }
+                ],
+            },
+        )
+        manager.select_worker = lambda model, count: (manager.workers["worker-1"], ["0"])
+        manager.next_port = lambda worker: 18002
+        actions = []
+
+        def remote_action(server_id, payload, timeout=90):
+            actions.append(payload["action"])
+            return {"ok": True, "channel_id": 9} if payload["action"] == "oneapi_channel" else {"ok": True}
+
+        manager.remote_action = remote_action
+        service = manager.create_service(manager.model_by_key("Qwen-Test"), 1, created_by=1)
+        self.assertEqual(actions, ["deploy", "oneapi_channel"])
+        self.assertEqual([item.get("progress_percent") for item in store.updates], [35, 80, 100])
+        self.assertEqual(service["status"], "running")
+        self.assertEqual(service["progress_stage"], "running")
 
 
 if __name__ == "__main__":

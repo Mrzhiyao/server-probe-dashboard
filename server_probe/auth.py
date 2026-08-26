@@ -186,12 +186,24 @@ class AuthStore:
                       oneapi_channel_id BIGINT,
                       source TEXT NOT NULL DEFAULT 'managed',
                       error_message TEXT,
+                      progress_stage TEXT,
+                      progress_percent INTEGER NOT NULL DEFAULT 0,
                       created_by BIGINT REFERENCES probe_users(id) ON DELETE SET NULL,
                       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                       started_at TIMESTAMPTZ,
                       stopped_at TIMESTAMPTZ
                     )
+                    """
+                )
+                cur.execute("ALTER TABLE probe_model_services ADD COLUMN IF NOT EXISTS progress_stage TEXT")
+                cur.execute("ALTER TABLE probe_model_services ADD COLUMN IF NOT EXISTS progress_percent INTEGER NOT NULL DEFAULT 0")
+                cur.execute(
+                    """
+                    UPDATE probe_model_services
+                    SET progress_stage = COALESCE(progress_stage, 'running'),
+                        progress_percent = 100
+                    WHERE status = 'running' AND progress_percent < 100
                     """
                 )
                 cur.execute(
@@ -448,13 +460,15 @@ class AuthStore:
             "oneapi_channel_id": row[11],
             "source": row[12],
             "error_message": row[13],
-            "created_at": row[14].isoformat() if row[14] else None,
-            "updated_at": row[15].isoformat() if row[15] else None,
-            "started_at": row[16].isoformat() if row[16] else None,
-            "stopped_at": row[17].isoformat() if row[17] else None,
-            "active_allocations": int(row[18] or 0),
-            "total_allocations": int(row[19] or 0),
-            "next_expiry": row[20].isoformat() if row[20] else None,
+            "progress_stage": row[14],
+            "progress_percent": int(row[15] or 0),
+            "created_at": row[16].isoformat() if row[16] else None,
+            "updated_at": row[17].isoformat() if row[17] else None,
+            "started_at": row[18].isoformat() if row[18] else None,
+            "stopped_at": row[19].isoformat() if row[19] else None,
+            "active_allocations": int(row[20] or 0),
+            "total_allocations": int(row[21] or 0),
+            "next_expiry": row[22].isoformat() if row[22] else None,
         }
 
     def model_service_select_sql(self):
@@ -463,6 +477,7 @@ class AuthStore:
               s.id, s.model_key, s.model_name, s.served_name, s.status,
               s.worker_id, s.worker_name, s.container_name, s.gpu_indices,
               s.host_port, s.image, s.oneapi_channel_id, s.source, s.error_message,
+              s.progress_stage, s.progress_percent,
               s.created_at, s.updated_at, s.started_at, s.stopped_at,
               COUNT(a.id) FILTER (
                 WHERE a.status = 'active' AND (a.expires_at IS NULL OR a.expires_at > now())
@@ -539,8 +554,8 @@ class AuthStore:
                     INSERT INTO probe_model_services (
                       model_key, model_name, served_name, status, worker_id, worker_name,
                       container_name, gpu_indices, host_port, image, oneapi_channel_id,
-                      source, error_message, created_by, started_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                      source, error_message, progress_stage, progress_percent, created_by, started_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                               CASE WHEN %s = 'running' THEN now() ELSE NULL END)
                     RETURNING id
                     """,
@@ -549,7 +564,8 @@ class AuthStore:
                         data.get("status") or "deploying", data.get("worker_id"), data.get("worker_name"),
                         data.get("container_name"), Json(data.get("gpu_indices") or []), data.get("host_port"),
                         data.get("image"), data.get("oneapi_channel_id"), data.get("source") or "managed",
-                        data.get("error_message"), data.get("created_by"), data.get("status") or "deploying",
+                        data.get("error_message"), data.get("progress_stage"), int(data.get("progress_percent") or 0),
+                        data.get("created_by"), data.get("status") or "deploying",
                     ),
                 )
                 service_id = cur.fetchone()[0]
@@ -565,8 +581,8 @@ class AuthStore:
                     INSERT INTO probe_model_services (
                       model_key, model_name, served_name, status, worker_id, worker_name,
                       container_name, gpu_indices, host_port, image, oneapi_channel_id,
-                      source, created_by, started_at
-                    ) VALUES (%s, %s, %s, 'running', %s, %s, %s, %s, %s, %s, %s, 'seed', %s, now())
+                      source, progress_stage, progress_percent, created_by, started_at
+                    ) VALUES (%s, %s, %s, 'running', %s, %s, %s, %s, %s, %s, %s, 'seed', 'running', 100, %s, now())
                     ON CONFLICT (container_name) DO NOTHING
                     RETURNING id
                     """,
@@ -593,6 +609,8 @@ class AuthStore:
             "host_port": "host_port",
             "oneapi_channel_id": "oneapi_channel_id",
             "error_message": "error_message",
+            "progress_stage": "progress_stage",
+            "progress_percent": "progress_percent",
         }
         assignments = []
         params = []

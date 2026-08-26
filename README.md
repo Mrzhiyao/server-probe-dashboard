@@ -149,6 +149,8 @@ PROBE_MODEL_DEPLOYMENT_CONFIG=/opt/server-probe-dashboard/config/model-deploymen
 
 Only administrators can deploy directly or approve a model request. The generated API key is returned once by the protected deployment endpoint and is sent by the Feishu bot as a private message; list and status APIs never include token secrets. Worker model roots, GPU allowlists, Docker images, port ranges, One API database paths, and optional pre-existing seed services are all configured outside Git.
 
+The administrator model page provides a live deployment form and polls persisted service stages (`GPU allocated`, `starting vLLM`, `registering One API`, and `running`). Explicit Feishu phrases such as “deploy model”, “which models are available”, “model status”, and “request model” use deterministic workflow routing, so those management entry points remain available when the optional LLM planner is slow or unavailable.
+
 `PROBE_MODEL_CATALOG_ROOT` is the path visible to the dashboard host. `PROBE_MODEL_DEPLOYMENT_ROOT` is the corresponding read-only path on deployment workers. Verification and enablement settings are stored in PostgreSQL; NAS credentials and model contents are not stored in the database or returned to normal users.
 
 Admins can change any dashboard user's password, and users can change their own password after entering the current password. Password changes can also be synced to machine accounts with the same username recorded in the machine-account index; the dashboard updates those machines through the same root or sudo-capable provisioning credentials.

@@ -8,6 +8,7 @@ from server_probe.feishu_bot import (
     clean_command,
     combine_cards,
     compact_card,
+    deployable_models_card,
     idle_gpu_card,
     machine_catalog_card,
     model_form_card,
@@ -53,6 +54,21 @@ class FeishuCommandTests(unittest.TestCase):
         self.assertEqual(parse_command("申请模型"), ("request_model", ""))
         self.assertEqual(parse_command("模型状态"), ("model_status", ""))
         self.assertEqual(parse_command("创建模型"), ("deploy_model", ""))
+        self.assertEqual(parse_command("你会部署模型吗"), ("model_catalog", ""))
+        self.assertEqual(parse_command("你目前能部署哪些模型"), ("model_catalog", ""))
+        self.assertEqual(parse_command("有哪些模型正在运行"), ("model_status", ""))
+
+    def test_explicit_model_workflows_do_not_depend_on_llm(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append(request)
+            raise AssertionError("LLM should not be called")
+
+        router = LLMIntentRouter("https://newapi.example", "secret", "small-model", opener=opener)
+        self.assertEqual(router.plan("你目前能部署哪些模型")["intent"], "model_catalog")
+        self.assertEqual(router.plan("请部署模型")["intent"], "deploy_model")
+        self.assertEqual(calls, [])
 
     def test_duplicate_message_is_rejected(self):
         values = MessageDeduplicator()
@@ -305,6 +321,23 @@ class FeishuCommandTests(unittest.TestCase):
         )
         self.assertIn("Qwen-Test", status)
         self.assertIn("运行正常", status)
+        catalog = json.dumps(
+            deployable_models_card(
+                models,
+                {
+                    "services": [
+                        {
+                            "model_key": "Qwen-Test",
+                            "worker_name": "GPU worker",
+                            "gpu_indices": ["0"],
+                            "runtime": {"status": "running", "health": "healthy"},
+                        }
+                    ]
+                },
+            ),
+            ensure_ascii=False,
+        )
+        self.assertIn("已运行，可直接复用", catalog)
         approval = json.dumps(
             pending_requests_card(
                 [

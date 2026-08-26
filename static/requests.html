@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Request Center - Server Probe Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260825-models" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260826-model-progress" />
   </head>
   <body>
     <div class="app-shell">
@@ -92,6 +92,37 @@
         </section>
 
         <section id="modelsPage" class="page-view" hidden>
+          <section id="modelDeploymentPanel" class="request-panel wide model-deployment-panel" data-admin-only hidden>
+            <div class="panel-head">
+              <div>
+                <h2>动态部署</h2>
+                <span id="modelServiceSummary">正在读取模型服务</span>
+              </div>
+              <button id="reloadModelServicesButton" class="button ghost" type="button">刷新状态</button>
+            </div>
+            <form id="modelDeployForm" class="model-deploy-form">
+              <label>
+                模型
+                <select name="model_key" required><option value="">请选择已开放模型</option></select>
+              </label>
+              <label>使用人 <input name="owner_name" required /></label>
+              <label>
+                GPU 数量
+                <select name="gpu_count" required>
+                  <option value="1">1 张</option>
+                  <option value="2">2 张</option>
+                  <option value="4">4 张</option>
+                  <option value="8">8 张</option>
+                </select>
+              </label>
+              <label>授权时长 小时 <input name="duration_hours" type="number" min="1" max="720" value="24" required /></label>
+              <label class="model-deploy-purpose">用途 <input name="purpose" value="管理员部署模型 API" required /></label>
+              <button class="button model-deploy-submit" type="submit">部署并创建授权</button>
+            </form>
+            <p id="modelDeployMessage" class="form-message"></p>
+            <div id="modelServiceList" class="model-service-list"></div>
+          </section>
+
           <section class="request-panel wide model-catalog-panel">
             <div class="panel-head">
               <div>
@@ -207,6 +238,6 @@
         </section>
       </main>
     </div>
-    <script src="/static/requests.js?v=20260825-managed-models"></script>
+    <script src="/static/requests.js?v=20260826-model-progress"></script>
   </body>
 </html>

@@ -306,10 +306,14 @@ class ModelServiceManager:
     def runtime_for_service(self, service):
         result = self.snapshot_result(service.get("worker_id"))
         if not result or result.get("status") != "online":
+            if service.get("status") == "deploying":
+                return {"status": "deploying", "health": "starting"}
             return {"status": "worker_offline", "health": "unknown"}
         containers = (((result.get("metrics") or {}).get("docker") or {}).get("containers") or [])
         container = next((item for item in containers if item.get("name") == service.get("container_name")), None)
         if not container:
+            if service.get("status") == "deploying":
+                return {"status": "deploying", "health": "starting"}
             return {"status": "missing", "health": "missing"}
         probe = ((container.get("vllm") or {}).get("probe") or {})
         return {
@@ -423,9 +427,14 @@ class ModelServiceManager:
                 "image": worker.get("image"),
                 "source": "managed",
                 "created_by": created_by,
+                "progress_stage": "gpu_allocated",
+                "progress_percent": 15,
             }
         )
         try:
+            self.store.update_model_service(
+                service["id"], progress_stage="starting_vllm", progress_percent=35
+            )
             self.remote_action(
                 worker_id,
                 {
@@ -447,6 +456,9 @@ class ModelServiceManager:
                 },
                 timeout=int(worker.get("startup_timeout_seconds") or 600) + 120,
             )
+            self.store.update_model_service(
+                service["id"], progress_stage="registering_gateway", progress_percent=80
+            )
             channel_host = str(worker.get("oneapi_base_url") or "http://127.0.0.1:{port}").format(port=port)
             oneapi_result = self.remote_action(
                 str(self.oneapi.get("server_id") or worker_id),
@@ -466,9 +478,17 @@ class ModelServiceManager:
                 status="running",
                 oneapi_channel_id=oneapi_result.get("channel_id"),
                 error_message=None,
+                progress_stage="running",
+                progress_percent=100,
             )
         except Exception as exc:
-            self.store.update_model_service(service["id"], status="failed", error_message=str(exc)[:1000])
+            self.store.update_model_service(
+                service["id"],
+                status="failed",
+                error_message=str(exc)[:1000],
+                progress_stage="failed",
+                progress_percent=100,
+            )
             raise
 
     def token_action(self, action, **values):

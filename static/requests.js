@@ -4,6 +4,8 @@ const state = {
   machines: [],
   users: [],
   models: [],
+  modelServices: [],
+  modelDeploymentPending: false,
   page: "submit",
   kind: "temporary",
 };
@@ -24,6 +26,12 @@ const els = {
   reloadModelsButton: document.querySelector("#reloadModelsButton"),
   modelSearch: document.querySelector("#modelSearch"),
   modelCategory: document.querySelector("#modelCategory"),
+  modelDeploymentPanel: document.querySelector("#modelDeploymentPanel"),
+  modelDeployForm: document.querySelector("#modelDeployForm"),
+  modelDeployMessage: document.querySelector("#modelDeployMessage"),
+  modelServiceList: document.querySelector("#modelServiceList"),
+  modelServiceSummary: document.querySelector("#modelServiceSummary"),
+  reloadModelServicesButton: document.querySelector("#reloadModelServicesButton"),
   temporaryForm: document.querySelector("#temporaryForm"),
   accessForm: document.querySelector("#accessForm"),
   temporaryMessage: document.querySelector("#temporaryMessage"),
@@ -43,6 +51,8 @@ const els = {
   approvedCount: document.querySelector("#approvedCount"),
   rejectedCount: document.querySelector("#rejectedCount"),
 };
+
+let modelServicePollTimer = null;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -112,6 +122,11 @@ function setPage(page) {
   document.querySelectorAll(".tab-button").forEach((button) => {
     button.classList.toggle("active", button.dataset.page === page);
   });
+  if (page === "models" && state.user?.role === "admin") {
+    scheduleModelServicePoll(0);
+  } else {
+    stopModelServicePoll();
+  }
 }
 
 function modelCategoryText(category) {
@@ -277,12 +292,139 @@ async function loadModels(force = false) {
     const enabled = state.models.filter((model) => model.enabled).length;
     els.modelCatalogSummary.textContent = state.user?.role === "admin" ? `${state.models.length} 个目录 · ${enabled} 个已开放` : `${enabled} 个模型可申请`;
     renderModels();
+    renderModelDeployOptions();
   } catch (error) {
     els.modelCatalog.innerHTML = `<div class="error-box">${escapeHtml(error.message || "模型目录读取失败")}</div>`;
     els.modelCatalogSummary.textContent = "模型目录不可用";
   } finally {
     els.reloadModelsButton.disabled = false;
   }
+}
+
+function fmtBytes(value) {
+  const bytes = Number(value || 0);
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / 1024 ** index).toFixed(index >= 3 ? 1 : 0)} ${units[index]}`;
+}
+
+function modelProgressText(stage) {
+  return {
+    gpu_allocated: "GPU 已分配",
+    starting_vllm: "正在启动 vLLM",
+    registering_gateway: "正在注册 OneAPI",
+    running: "运行正常",
+    failed: "部署失败",
+  }[stage] || stage || "等待调度";
+}
+
+function modelServiceStatusText(service) {
+  if (service.status === "deploying") return "部署中";
+  if (service.status === "failed") return "部署失败";
+  const runtime = service.runtime || {};
+  if (runtime.status === "running" && runtime.health === "healthy") return "运行正常";
+  if (runtime.status === "worker_offline") return "机器离线";
+  if (runtime.status === "missing") return "容器缺失";
+  return runtime.status || service.status || "未知";
+}
+
+function modelServiceCard(service) {
+  const runtime = service.runtime || {};
+  const progress = Math.max(0, Math.min(100, Number(service.progress_percent || 0)));
+  const statusClass = service.status === "failed" ? "failed" : service.status === "deploying" ? "deploying" : "running";
+  const resourceParts = [];
+  if (runtime.gpu_memory_used_bytes !== undefined) resourceParts.push(`显存 ${fmtBytes(runtime.gpu_memory_used_bytes)}`);
+  if (runtime.memory_used_bytes !== undefined) resourceParts.push(`内存 ${fmtBytes(runtime.memory_used_bytes)}`);
+  if (runtime.cpu_percent !== undefined && runtime.cpu_percent !== null) resourceParts.push(`CPU ${Number(runtime.cpu_percent).toFixed(1)}%`);
+  return `<article class="model-service-card ${statusClass}">
+    <div class="model-service-head">
+      <div>
+        <h3>${escapeHtml(service.served_name || service.model_name || service.model_key)}</h3>
+        <p>${escapeHtml(service.worker_name || service.worker_id || "-")} · GPU ${escapeHtml((service.gpu_indices || []).join(", ") || "-")}</p>
+      </div>
+      <span class="state-pill ${statusClass}">${escapeHtml(modelServiceStatusText(service))}</span>
+    </div>
+    <div class="model-service-progress" aria-label="部署进度 ${progress}%">
+      <div style="width:${progress}%"></div>
+    </div>
+    <div class="model-service-progress-line">
+      <span>${escapeHtml(modelProgressText(service.progress_stage))}</span>
+      <strong>${progress}%</strong>
+    </div>
+    <div class="model-service-meta">
+      <span>容器 <code>${escapeHtml(service.container_name || "-")}</code></span>
+      <span>端口 <code>${escapeHtml(service.host_port || "-")}</code></span>
+      <span>有效授权 <strong>${service.active_allocations || 0}</strong></span>
+      ${resourceParts.length ? `<span>${escapeHtml(resourceParts.join(" · "))}</span>` : ""}
+    </div>
+    ${service.error_message ? `<p class="model-service-error">${escapeHtml(service.error_message)}</p>` : ""}
+  </article>`;
+}
+
+function renderModelServices() {
+  if (!els.modelServiceList) return;
+  els.modelServiceList.innerHTML = state.modelServices.length
+    ? state.modelServices.map(modelServiceCard).join("")
+    : `<div class="empty">还没有模型服务</div>`;
+  const running = state.modelServices.filter((service) => modelServiceStatusText(service) === "运行正常").length;
+  const deploying = state.modelServices.filter((service) => service.status === "deploying").length;
+  els.modelServiceSummary.textContent = `${state.modelServices.length} 个服务 · ${running} 个运行${deploying ? ` · ${deploying} 个部署中` : ""}`;
+}
+
+function renderModelDeployOptions() {
+  if (!els.modelDeployForm) return;
+  const select = els.modelDeployForm.elements.model_key;
+  const current = select.value;
+  const models = state.models.filter((model) => model.enabled && model.candidate);
+  select.innerHTML = `<option value="">请选择已开放模型</option>${models
+    .map(
+      (model) =>
+        `<option value="${escapeHtml(model.key)}">${escapeHtml(model.name)} · ${escapeHtml(model.recommended_gpu_count || 1)} GPU · ${escapeHtml(model.weight_gib || 0)} GB</option>`
+    )
+    .join("")}`;
+  if (models.some((model) => model.key === current)) select.value = current;
+  if (!select.value && models.length === 1) select.value = models[0].key;
+  syncModelDeployGpuCount();
+}
+
+function syncModelDeployGpuCount() {
+  if (!els.modelDeployForm) return;
+  const key = els.modelDeployForm.elements.model_key.value;
+  const model = state.models.find((item) => item.key === key);
+  if (model) els.modelDeployForm.elements.gpu_count.value = String(Math.max(1, model.recommended_gpu_count || 1));
+}
+
+async function loadModelServices(silent = false) {
+  if (state.user?.role !== "admin" || !els.modelServiceList) return;
+  if (!silent) els.reloadModelServicesButton.disabled = true;
+  try {
+    const payload = await fetchJson("/api/model-services");
+    state.modelServices = payload.services || [];
+    renderModelServices();
+  } catch (error) {
+    if (!silent) {
+      els.modelServiceList.innerHTML = `<div class="error-box">${escapeHtml(error.message || "模型服务状态读取失败")}</div>`;
+      els.modelServiceSummary.textContent = "模型服务不可用";
+    }
+  } finally {
+    if (!silent) els.reloadModelServicesButton.disabled = false;
+  }
+}
+
+function stopModelServicePoll() {
+  if (modelServicePollTimer) window.clearTimeout(modelServicePollTimer);
+  modelServicePollTimer = null;
+}
+
+function scheduleModelServicePoll(delay = 3000) {
+  stopModelServicePoll();
+  if (state.user?.role !== "admin" || state.page !== "models") return;
+  modelServicePollTimer = window.setTimeout(async () => {
+    await loadModelServices(true);
+    const active = state.modelDeploymentPending || state.modelServices.some((service) => service.status === "deploying");
+    scheduleModelServicePoll(active ? 2000 : 8000);
+  }, delay);
 }
 
 function setKind(kind) {
@@ -746,6 +888,8 @@ async function start() {
     });
     document.querySelector('[data-page="review"]').textContent = "申请审批";
     await loadUsers();
+    if (els.modelDeployForm) els.modelDeployForm.elements.owner_name.value = currentDisplayName();
+    await loadModelServices();
     syncPasswordFormRole();
     setPage("review");
   } else {
@@ -824,7 +968,48 @@ els.directProvisionForm.addEventListener("submit", async (event) => {
   }
 });
 
+els.modelDeployForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = els.modelDeployForm.querySelector("button[type='submit']");
+  const payload = formPayload(els.modelDeployForm);
+  showMessage(els.modelDeployMessage, "部署任务已提交，正在分配资源...");
+  state.modelDeploymentPending = true;
+  button.disabled = true;
+  scheduleModelServicePoll(300);
+  try {
+    const result = await fetchJson("/api/model-services/deploy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const credential = result.credential || {};
+    const service = result.service || {};
+    const lines = [
+      result.reused ? "已复用现有模型服务并创建新授权" : "模型服务已部署并创建授权",
+      `模型：${credential.model || service.served_name || "-"}`,
+      `机器：${service.worker_name || service.worker_id || "-"}`,
+      `GPU：${(service.gpu_indices || []).join(", ") || "-"}`,
+      `Base URL：${credential.base_url || "-"}`,
+      `API Key：${credential.api_key || "-"}`,
+      `到期：${credential.expires_at || "-"}`,
+      credential.access_hint ? `连接：${credential.access_hint}` : "",
+    ].filter(Boolean);
+    showMessage(els.modelDeployMessage, escapeHtml(lines.join("\n")).replaceAll("\n", "<br />"));
+    showToast(result.reused ? "已复用模型并创建授权" : "模型部署完成");
+    await loadModelServices(true);
+  } catch (error) {
+    showMessage(els.modelDeployMessage, escapeHtml(error.message || "模型部署失败"), true);
+    showToast(error.message || "模型部署失败", true);
+    await loadModelServices(true);
+  } finally {
+    state.modelDeploymentPending = false;
+    button.disabled = false;
+    scheduleModelServicePoll(2000);
+  }
+});
+
 els.directProvisionForm.elements.account_type.addEventListener("change", syncDirectProvisionDuration);
+els.modelDeployForm.elements.model_key.addEventListener("change", syncModelDeployGpuCount);
 els.passwordForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   showMessage(els.passwordMessage, "");
@@ -869,6 +1054,7 @@ els.passwordForm.addEventListener("submit", async (event) => {
 });
 els.reloadButton.addEventListener("click", loadRequests);
 els.reloadModelsButton.addEventListener("click", () => loadModels(state.user?.role === "admin"));
+els.reloadModelServicesButton.addEventListener("click", () => loadModelServices(false));
 els.modelSearch.addEventListener("input", renderModels);
 els.modelCategory.addEventListener("change", renderModels);
 els.logoutButton.addEventListener("click", async () => {
