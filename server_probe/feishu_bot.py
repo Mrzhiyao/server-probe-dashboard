@@ -201,16 +201,7 @@ class LLMIntentRouter:
     def plans(self, text, previous=None, inventory=None):
         text = clean_command(text)[:500]
         safety_guard = parse_command(text)
-        if safety_guard[0] in {
-            "admin_disabled",
-            "request_account",
-            "pending_requests",
-            "provision_account",
-            "request_model",
-            "model_catalog",
-            "model_status",
-            "deploy_model",
-        }:
+        if safety_guard[0] == "admin_disabled":
             return [self.fallback_plan(text)]
         if not self.enabled:
             return [self.fallback_plan(text)]
@@ -273,6 +264,7 @@ class LLMIntentRouter:
             "request_model 是用户申请部署目录中已有模型的 API；model_status 查询已部署模型服务，可把模型关键词放 argument；"
             "model_catalog 查询当前目录中已验证且可以部署的模型清单；"
             "deploy_model 是管理员直接部署模型。"
+            "询问系统是否会部署模型、具备哪些模型部署能力、有哪些权重可以提供推理 API，必须使用 model_catalog，不能用 chat。"
             "句子明确包含‘部署模型’‘创建模型’‘启动模型’时必须使用 deploy_model，不能因为不知道发送者角色而降级成 request_model；"
             "只有‘申请模型’‘申请模型 API’‘想使用某模型’才使用 request_model，权限由后端另行判断。"
             "删除账号、改密码、直接批准等未开放写操作用 admin_disabled。真正不明确时用 clarify，clarification 给一句具体追问。"
@@ -287,6 +279,8 @@ class LLMIntentRouter:
             "\"group\":null,\"idle_only\":true,\"min_free_gpu_memory_gb\":null,\"gpu_model\":null},"
             "\"clarification\":\"\"}]}。"
             "示例：‘你还会啥？有哪些用户最近使用机器量很大’必须拆成两个动作：help 和 top_users，不能忽略后一个问题。"
+            "示例：‘你会部署模型吗’输出 model_catalog；‘目前有哪些权重能做成接口’输出 model_catalog；"
+            "‘给我起一个 Qwen 推理服务’输出 deploy_model；‘刚才那个模型起到哪一步了’输出 model_status。"
             "示例：‘你知道八卡机是啥吗’输出 machine_catalog，filters.gpu_count=8；后端会回答当前对应机器。"
             "示例：‘八卡机什么进程占用最高’输出 resource_query，query.entity=process、query.metric=gpu_memory、"
             "query.limit=5、query.scope.gpu_count=8。"

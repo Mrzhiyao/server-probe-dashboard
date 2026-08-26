@@ -58,17 +58,33 @@ class FeishuCommandTests(unittest.TestCase):
         self.assertEqual(parse_command("你目前能部署哪些模型"), ("model_catalog", ""))
         self.assertEqual(parse_command("有哪些模型正在运行"), ("model_status", ""))
 
-    def test_explicit_model_workflows_do_not_depend_on_llm(self):
+    def test_model_workflows_use_llm_as_primary_planner(self):
         calls = []
 
         def opener(request, timeout):
-            calls.append(request)
-            raise AssertionError("LLM should not be called")
+            prompt = json.loads(json.loads(request.data)["messages"][1]["content"])
+            calls.append(prompt["text"])
+            intent = "deploy_model" if prompt["text"] == "请部署模型" else "model_catalog"
+            return FakeResponse(
+                {"choices": [{"message": {"content": json.dumps({"intent": intent, "argument": "", "filters": {}})}}]}
+            )
 
         router = LLMIntentRouter("https://newapi.example", "secret", "small-model", opener=opener)
         self.assertEqual(router.plan("你目前能部署哪些模型")["intent"], "model_catalog")
         self.assertEqual(router.plan("请部署模型")["intent"], "deploy_model")
-        self.assertEqual(calls, [])
+        self.assertEqual(router.plan("现在哪些权重适合直接挂成推理接口")["intent"], "model_catalog")
+        self.assertEqual(calls, ["你目前能部署哪些模型", "请部署模型", "现在哪些权重适合直接挂成推理接口"])
+
+    def test_known_model_workflow_falls_back_when_llm_times_out(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append(timeout)
+            raise TimeoutError("provider timeout")
+
+        router = LLMIntentRouter("https://newapi.example", "secret", "small-model", timeout=3, opener=opener)
+        self.assertEqual(router.plan("你目前能部署哪些模型")["intent"], "model_catalog")
+        self.assertEqual(calls, [3.0])
 
     def test_duplicate_message_is_rejected(self):
         values = MessageDeduplicator()
