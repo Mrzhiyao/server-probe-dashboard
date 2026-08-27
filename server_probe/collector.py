@@ -300,10 +300,15 @@ def parse_cifs_debug(text):
             continue
         status_match = re.search(r"TCP status:\s*(\d+)", section)
         status = int(status_match.group(1)) if status_match else None
-        servers[host_match.group(1).lower()] = {
-            "connected": status == 1 and "DISCONNECTED" not in section,
-            "tcp_status": status,
-        }
+        host = host_match.group(1).lower()
+        connected = status == 1 and "DISCONNECTED" not in section
+        current = servers.setdefault(host, {"connected": False, "tcp_status": status, "session_count": 0})
+        current["session_count"] += 1
+        if connected:
+            current["connected"] = True
+            current["tcp_status"] = 1
+        elif not current["connected"]:
+            current["tcp_status"] = status
     return servers
 
 
@@ -344,6 +349,17 @@ def network_mount_probe(mount, cifs_servers=None, timeout=3.0):
             "latency_ms": round((time.monotonic() - started) * 1000.0, 1),
             "error": "network service is unreachable",
         }
+
+
+def mount_is_available(mount):
+    status = mount.get("status")
+    if status == "mounted":
+        return True
+    return bool(
+        status == "automount_only"
+        and mount.get("automount")
+        and mount.get("connection") in ("connected", "reachable")
+    )
 
 
 def diskstats_snapshot(text=None):
@@ -573,7 +589,11 @@ def storage_info(disk_before=None, disk_after=None, elapsed_seconds=None):
             if io:
                 item["io"] = io
 
-    mounted_network = [item for item in mounts if item["status"] == "mounted" and item.get("kind") == "network"]
+    mounted_network = [
+        item
+        for item in mounts
+        if item["status"] in ("mounted", "automount_only") and item.get("kind") == "network"
+    ]
     if mounted_network:
         cifs_servers = parse_cifs_debug(read_first("/proc/fs/cifs/DebugData"))
         workers = min(6, len(mounted_network))
@@ -581,7 +601,7 @@ def storage_info(disk_before=None, disk_after=None, elapsed_seconds=None):
             probes = list(executor.map(lambda item: network_mount_probe(item, cifs_servers), mounted_network))
         for item, probe in zip(mounted_network, probes):
             item.update(probe)
-            if probe.get("error"):
+            if probe.get("error") and item.get("status") == "mounted":
                 item["status"] = "unresponsive"
 
     devices = sysfs_block_devices()
@@ -598,7 +618,7 @@ def storage_info(disk_before=None, disk_after=None, elapsed_seconds=None):
     mount_issues = sum(
         1
         for item in mounts
-        if item.get("status") == "unresponsive" or (item.get("expected") and item.get("status") != "mounted")
+        if item.get("status") == "unresponsive" or (item.get("expected") and not mount_is_available(item))
     )
     smart_issues = sum(1 for item in devices if (item.get("smart") or {}).get("health") in ("warning", "failed"))
     return {

@@ -29,6 +29,18 @@ class CollectorStorageTests(unittest.TestCase):
         self.assertFalse(servers["p8.example"]["connected"])
         self.assertEqual(servers["p8.example"]["tcp_status"], 5)
 
+    def test_connected_cifs_session_wins_over_stale_session_for_same_host(self):
+        data = """1) ConnectionId: 0x1 Hostname: p8.example
+TCP status: 1 Instance: 1
+2) ConnectionId: 0x2 Hostname: p8.example
+TCP status: 5 Instance: 2
+DISCONNECTED
+"""
+        servers = collector.parse_cifs_debug(data)
+        self.assertTrue(servers["p8.example"]["connected"])
+        self.assertEqual(servers["p8.example"]["tcp_status"], 1)
+        self.assertEqual(servers["p8.example"]["session_count"], 2)
+
     def test_network_source_host(self):
         self.assertEqual(collector.network_source_host("//nas.example/share/team", "cifs"), ("nas.example", 445))
         self.assertEqual(collector.network_source_host("192.0.2.10:/exports/data", "nfs"), ("192.0.2.10", 2049))
@@ -68,13 +80,14 @@ class CollectorStorageTests(unittest.TestCase):
         self.assertTrue(nas["automount"])
         self.assertEqual(storage["summary"]["mount_issue_count"], 0)
 
-    def test_automount_without_real_filesystem_is_an_issue(self):
+    def test_reachable_automount_placeholder_is_ready(self):
         storage = self.storage("\n".join([MOUNTINFO_ROOT, MOUNTINFO_AUTOFS]))
         nas = next(item for item in storage["mounts"] if item["mount"] == "/nas")
         self.assertEqual(nas["status"], "automount_only")
         self.assertEqual(nas["source"], "//p8.example/share/Ray")
         self.assertEqual(nas["fstype"], "cifs")
-        self.assertEqual(storage["summary"]["mount_issue_count"], 1)
+        self.assertEqual(nas["connection"], "reachable")
+        self.assertEqual(storage["summary"]["mount_issue_count"], 0)
 
     def test_smart_attribute_uses_raw_value(self):
         data = {
@@ -139,6 +152,24 @@ class StorageAlertTests(unittest.TestCase):
         self.assertEqual(alerts[0]["kind"], "mount")
         self.assertEqual(alerts[0]["severity"], "critical")
         self.assertEqual(alerts[0]["path"], "/nas")
+
+    def test_reachable_automount_placeholder_has_no_alert(self):
+        result = self.result(
+            {
+                "mounts": [
+                    {
+                        "mount": "/nas",
+                        "source": "//p8.example/share/Ray",
+                        "status": "automount_only",
+                        "expected": True,
+                        "automount": True,
+                        "connection": "reachable",
+                    }
+                ],
+                "devices": [],
+            }
+        )
+        self.assertEqual(self.monitor().alerts_for_result(result), [])
 
     def test_inode_and_smart_warnings(self):
         result = self.result(

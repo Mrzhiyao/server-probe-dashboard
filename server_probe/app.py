@@ -158,6 +158,17 @@ def request_client_ip(peer_address, real_ip_header=""):
     return peer
 
 
+def mount_is_available(mount):
+    status = mount.get("status")
+    if status == "mounted":
+        return True
+    return bool(
+        status == "automount_only"
+        and mount.get("automount")
+        and mount.get("connection") in ("connected", "reachable")
+    )
+
+
 def public_server(server):
     safe = {
         "id": server["id"],
@@ -519,7 +530,7 @@ class Monitor:
         summary["mount_issue_count"] = sum(
             1
             for item in mounts
-            if item.get("status") == "unresponsive" or (item.get("expected") and item.get("status") != "mounted")
+            if item.get("status") == "unresponsive" or (item.get("expected") and not mount_is_available(item))
         )
         summary["network_mount_count"] = sum(1 for item in mounts if item.get("kind") == "network")
 
@@ -944,7 +955,7 @@ class Monitor:
         for mount in storage.get("mounts") or []:
             mount_path = mount.get("mount") or "mount"
             status = mount.get("status")
-            if mount.get("expected") and status != "mounted":
+            if mount.get("expected") and not mount_is_available(mount):
                 message = {
                     "automount_only": "automatic mount placeholder is active but the real filesystem is not mounted",
                     "unresponsive": "network storage connection is unavailable",
